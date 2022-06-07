@@ -45,6 +45,7 @@
 #  include <sys/types.h>
 #endif
 #include <sys/time.h>
+#include <stdlib.h>
 #include "services/outside_network.h"
 #include "services/listen_dnsport.h"
 #include "services/cache/infra.h"
@@ -79,6 +80,10 @@
 #define MAX_PORT_RETRY 10000
 /** number of retries on outgoing UDP queries */
 #define OUTBOUND_UDP_RETRY 1
+
+#define UNBOUND_MARKKEY "unbound:markkey"
+#define PLATFORM_VERIFICATION_KEY "sys:bone:jwt"
+#define MARK_UPDATE_INTERVAL_MILLIS 5000
 
 /** initiate TCP transaction for serviced query */
 static void serviced_tcp_initiate(struct serviced_query* sq, sldns_buffer* buff);
@@ -134,6 +139,44 @@ serviced_cmp(const void* key1, const void* key2)
 	if((r = edns_opt_list_compare(q1->opt_list, q2->opt_list)) != 0)
 		return r;
 	return sockaddr_cmp(&q1->addr, q1->addrlen, &q2->addr, q2->addrlen);
+}
+
+static void update_fwmark(struct outside_network* outnet) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint64_t now_millis = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	if (now_millis - outnet->last_mark_update_millis > MARK_UPDATE_INTERVAL_MILLIS) {
+		redisReply *keyReply = redisCommand(outnet->redisCtx, "GET " UNBOUND_MARKKEY);
+		if (keyReply != NULL) {
+			if (keyReply->str != NULL && strlen(keyReply->str) > 0) {
+				//log_info("Mark key: %s", keyReply->str);
+				char getMarkCommand[128];
+				snprintf(getMarkCommand, 128, "GET %s", keyReply->str);
+				redisReply *markReply = redisCommand(outnet->redisCtx, getMarkCommand);
+				if (markReply != NULL) {
+					if (markReply->str != NULL && strlen(markReply->str) > 0) {
+						outnet->fwmark = atoi(markReply->str);
+						log_info("Update fwmark: %d", outnet->fwmark);
+					} else {
+						log_info("Empty mark value");
+						outnet->fwmark = 0;
+					}
+					freeReplyObject(markReply);
+				} else {
+					log_info("Get mark error");
+					outnet->fwmark = 0;
+				}
+			} else {
+				log_info("Empty markkey");
+				outnet->fwmark = 0;
+			}
+			freeReplyObject(keyReply);
+		} else {
+			log_info("Get markkey error");
+			outnet->fwmark = 0;
+		}
+		outnet->last_mark_update_millis = now_millis;
+	}
 }
 
 /** compare if the reuse element has the same address, port and same ssl-is
@@ -595,7 +638,7 @@ outnet_tcp_take_query_setup(int s, struct pending_tcp* pend,
 
 /** use next free buffer to service a tcp query */
 static int
-outnet_tcp_take_into_use(struct waiting_tcp* w)
+outnet_tcp_take_into_use(struct waiting_tcp* w, struct outside_network* outnet)
 {
 	struct pending_tcp* pend = w->outnet->tcp_free;
 	int s;
@@ -607,6 +650,11 @@ outnet_tcp_take_into_use(struct waiting_tcp* w)
 	pend->c->tcp_do_close = 0;
 	/* open socket */
 	s = outnet_get_tcp_fd(&w->addr, w->addrlen, w->outnet->tcp_mss, w->outnet->ip_dscp);
+
+	update_fwmark(outnet);
+	if (outnet->fwmark != 0) {
+		int r = setsockopt(s, SOL_SOCKET, SO_MARK, &outnet->fwmark, sizeof(outnet->fwmark));
+	}
 
 	if(s == -1)
 		return 0;
@@ -904,7 +952,7 @@ use_free_buffer(struct outside_network* outnet)
 			pend->reuse.pending = pend;
 			memcpy(&pend->reuse.addr, &w->addr, w->addrlen);
 			pend->reuse.addrlen = w->addrlen;
-			if(!outnet_tcp_take_into_use(w)) {
+			if(!outnet_tcp_take_into_use(w, outnet)) {
 				waiting_tcp_callback(w, NULL, NETEVENT_CLOSED,
 					NULL);
 				waiting_tcp_delete(w);
@@ -1542,6 +1590,22 @@ static int setup_if(struct port_if* pif, const char* addrstr,
 	return 1;
 }
 
+// return 0 on success
+static int verify_platform(redisContext *ctx) {
+	redisReply *reply = redisCommand(ctx, "TYPE " PLATFORM_VERIFICATION_KEY);
+	int result = 0;
+	if (reply == NULL) {
+		return 1;
+	}
+	if (reply->str != NULL && strcmp(reply->str, "string") == 0) {
+		result = 0;
+	} else {
+		result = 1;
+	}
+	freeReplyObject(reply);
+	return result;
+}
+
 struct outside_network* 
 outside_network_create(struct comm_base *base, size_t bufsize, 
 	size_t num_ports, char** ifs, int num_ifs, int do_ip4, 
@@ -1691,7 +1755,28 @@ outside_network_create(struct comm_base *base, size_t bufsize,
 			}
 		}
 	}
-	return outnet;
+	
+	redisContext *c = redisConnect("localhost", 6379);
+	if (c == NULL || c->err) {
+		if (c != NULL) {
+			log_err("Redis error: %s", c->errstr);
+		} else {
+			log_err("Cannot connect to redis");
+		}
+		exit(1);
+	}
+
+	outnet->last_mark_update_millis = 0;
+	outnet->fwmark = 0;
+
+	if (verify_platform(c) == 0) {
+		outnet->redisCtx = c;
+		return outnet;
+	} else {
+		log_err("Unsupported platform");
+		exit(2);
+	}
+
 }
 
 /** helper pending delete */
@@ -1892,7 +1977,7 @@ sai6_putrandom(struct sockaddr_in6 *sa, int pfxlen, struct ub_randstate *rnd)
  */
 static int
 udp_sockport(struct sockaddr_storage* addr, socklen_t addrlen, int pfxlen,
-	int port, int* inuse, struct ub_randstate* rnd, int dscp)
+	int port, int* inuse, struct ub_randstate* rnd, int dscp, struct outside_network* outnet)
 {
 	int fd, noproto;
 	if(addr_is_ip6(addr, addrlen)) {
@@ -1915,6 +2000,9 @@ udp_sockport(struct sockaddr_storage* addr, socklen_t addrlen, int pfxlen,
 			(struct sockaddr*)addr, addrlen, 1, inuse, &noproto,
 			0, 0, 0, NULL, 0, 0, 0, dscp);
 	}
+
+	update_fwmark(outnet);
+	int r = setsockopt(fd, SOL_SOCKET, SO_MARK, &outnet->fwmark, sizeof(outnet->fwmark));
 	return fd;
 }
 
@@ -2020,7 +2108,7 @@ select_ifport(struct outside_network* outnet, struct pending* pend,
 		my_port = portno = 0;
 #endif
 		fd = udp_sockport(&pif->addr, pif->addrlen, pif->pfxlen,
-			portno, &inuse, outnet->rnd, outnet->ip_dscp);
+			portno, &inuse, outnet->rnd, outnet->ip_dscp, outnet);
 		if(fd == -1 && !inuse) {
 			/* nonrecoverable error making socket */
 			return 0;
@@ -2390,7 +2478,7 @@ pending_tcp_query(struct serviced_query* sq, sldns_buffer* packet,
 			pend->reuse.pending = pend;
 			memcpy(&pend->reuse.addr, &sq->addr, sq->addrlen);
 			pend->reuse.addrlen = sq->addrlen;
-			if(!outnet_tcp_take_into_use(w)) {
+			if(!outnet_tcp_take_into_use(w, sq->outnet)) {
 				waiting_tcp_delete(w);
 				return NULL;
 			}
