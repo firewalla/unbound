@@ -52,6 +52,7 @@
 /* For struct timeval */
 #include <sys/time.h>
 #endif /* __QNX__ */
+#include "hiredis/hiredis.h"
 struct pending;
 struct pending_timeout;
 struct ub_randstate;
@@ -199,6 +200,10 @@ struct outside_network {
 	struct waiting_tcp* tcp_wait_first;
 	/** last of waiting query list */
 	struct waiting_tcp* tcp_wait_last;
+
+	redisContext *redisCtx;
+	uint64_t last_mark_update_millis;
+	uint32_t fwmark;
 };
 
 /**
