@@ -156,9 +156,9 @@ static void update_fwmark(struct outside_network* outnet) {
 				if (markReply != NULL) {
 					if (markReply->str != NULL && strlen(markReply->str) > 0) {
 						outnet->fwmark = atoi(markReply->str);
-						log_info("Update fwmark: %d", outnet->fwmark);
+						//log_info("Update fwmark: %d", outnet->fwmark);
 					} else {
-						log_info("Empty mark value");
+						//log_info("Empty mark value");
 						outnet->fwmark = 0;
 					}
 					freeReplyObject(markReply);
@@ -167,7 +167,7 @@ static void update_fwmark(struct outside_network* outnet) {
 					outnet->fwmark = 0;
 				}
 			} else {
-				log_info("Empty markkey");
+				//log_info("Empty markkey");
 				outnet->fwmark = 0;
 			}
 			freeReplyObject(keyReply);
