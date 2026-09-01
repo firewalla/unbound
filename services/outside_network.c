@@ -731,6 +731,11 @@ outnet_tcp_take_into_use(struct waiting_tcp* w, struct outside_network* outnet)
 		int r = setsockopt(s, SOL_SOCKET, SO_MARK, &outnet->fwmark, sizeof(outnet->fwmark));
 	}
 
+	update_fwmark(outnet);
+	if (outnet->fwmark != 0) {
+		int r = setsockopt(s, SOL_SOCKET, SO_MARK, &outnet->fwmark, sizeof(outnet->fwmark));
+	}
+
 	if(s == -1)
 		return 0;
 
