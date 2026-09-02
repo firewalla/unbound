@@ -1337,6 +1337,71 @@ static void mesh_test(void)
 	free(c1);
 }
 
+/** Verify packed_rr_to_string rejects assembled RRs larger than its fixed stack buffer. */
+static void
+packed_rrset_test(void)
+{
+	uint8_t maxdname[LDNS_MAX_DOMAINLEN];
+	struct ub_packed_rrset_key rrk;
+	struct packed_rrset_data d;
+	uint8_t* rr_data[1];
+	size_t rr_len[1];
+	time_t rr_ttl[1];
+	size_t dest_len = 65535*4+2048;
+	char* dest = (char*)malloc(dest_len);
+	int i;
+
+	unit_show_func("util/data/packed_rrset.c", "packed_rr_to_string");
+	unit_assert(dest);
+	memset(&rrk, 0, sizeof(rrk));
+	memset(&d, 0, sizeof(d));
+	rrk.entry.data = &d;
+	rrk.rk.rrset_class = htons(LDNS_RR_CLASS_IN);
+	rrk.rk.type = htons(LDNS_RR_TYPE_TXT);
+	d.count = 1;
+	d.rr_len = rr_len;
+	d.rr_ttl = rr_ttl;
+	d.rr_data = rr_data;
+	rr_ttl[0] = 3600;
+
+	/* Maximum-length DNS name: 127 one-byte labels plus root. */
+	for(i=0; i<127; i++) {
+		maxdname[i*2] = 1;
+		maxdname[i*2+1] = (uint8_t)'a';
+	}
+	maxdname[254] = 0;
+	rrk.rk.dname = maxdname;
+	rrk.rk.dname_len = sizeof(maxdname);
+
+	/* Exactly fills the 65535-byte assembly buffer and must succeed. */
+	rr_len[0] = 65535 - 255 - 8;
+	rr_data[0] = (uint8_t*)calloc(1, rr_len[0]);
+	unit_assert(rr_data[0]);
+	sldns_write_uint16(rr_data[0], (uint16_t)(rr_len[0]-2));
+	unit_assert(packed_rr_to_string(&rrk, 0, 0, dest, dest_len) == 1);
+	free(rr_data[0]);
+
+	/* One byte beyond the assembly buffer must be rejected. */
+	rr_len[0] = 65535 - 255 - 8 + 1;
+	rr_data[0] = (uint8_t*)calloc(1, rr_len[0]);
+	unit_assert(rr_data[0]);
+	sldns_write_uint16(rr_data[0], (uint16_t)(rr_len[0]-2));
+	unit_assert(packed_rr_to_string(&rrk, 0, 0, dest, dest_len) == 0);
+	unit_assert(dest[0] == 0);
+	free(rr_data[0]);
+
+	/* A valid DNS RDATA length can also make rlen exceed 65535. */
+	rr_len[0] = 2 + 65535;
+	rr_data[0] = (uint8_t*)calloc(1, rr_len[0]);
+	unit_assert(rr_data[0]);
+	sldns_write_uint16(rr_data[0], 65535);
+	unit_assert(packed_rr_to_string(&rrk, 0, 0, dest, dest_len) == 0);
+	unit_assert(dest[0] == 0);
+	free(rr_data[0]);
+
+	free(dest);
+}
+
 void unit_show_func(const char* file, const char* func)
 {
 	printf("test %s:%s\n", file, func);
@@ -1409,6 +1474,7 @@ main(int argc, char* argv[])
 	zonemd_test();
 	tcpreuse_test();
 	msgparse_test();
+	packed_rrset_test();
 	edns_ede_answer_encode_test();
 	localzone_test();
 	mesh_test();
