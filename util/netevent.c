@@ -6937,8 +6937,10 @@ comm_timer_disable(struct comm_timer* timer)
 {
 	if(!timer)
 		return;
-	ub_timer_del(timer->ev_timer->ev);
-	timer->ev_timer->enabled = 0;
+	if(timer->ev_timer->enabled) {
+		ub_timer_del(timer->ev_timer->ev);
+		timer->ev_timer->enabled = 0;
+	}
 }
 
 void
