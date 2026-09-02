@@ -12,6 +12,7 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: GCC on Linux
@@ -32,12 +33,12 @@ jobs:
           - name: OS X
             os: macos-latest
             install_expat: "yes"
-            config: "--enable-debug --disable-flto --with-ssl=/usr/local/opt/openssl --with-libexpat=/usr/local/opt/expat"
+            config: "--enable-debug --disable-flto --with-ssl=/opt/homebrew/opt/openssl --with-libexpat=/opt/homebrew/opt/expat"
             make_test: "yes"
           - name: Clang on OS X
             os: macos-latest
             install_expat: "yes"
-            config: "CC=clang --enable-debug --disable-flto --with-ssl=/usr/local/opt/openssl --with-libexpat=/usr/local/opt/expat --disable-static"
+            config: "CC=clang --enable-debug --disable-flto --with-ssl=/opt/homebrew/opt/openssl --with-libexpat=/opt/homebrew/opt/expat --disable-static"
             make_test: "yes"
             clang_analysis: "yes"
           - name: ubsan (gcc undefined behaviour sanitizer)
@@ -48,15 +49,6 @@ jobs:
             os: ubuntu-latest
             config: 'CFLAGS="-DNDEBUG -g2 -O3 -fsanitize=address" --disable-flto --disable-static'
             make_test: "yes"
-          - name: Apple iPhone on iOS, armv7
-            os: macos-latest
-            AUTOTOOLS_HOST: armv7-apple-ios
-            OPENSSL_HOST: ios-cross
-            IOS_SDK: iPhoneOS
-            IOS_CPU: armv7s
-            test_ios: "yes"
-            config: "no"
-            make: "no"
           - name: Apple iPhone on iOS, arm64
             os: macos-latest
             AUTOTOOLS_HOST: aarch64-apple-ios
@@ -81,15 +73,6 @@ jobs:
             OPENSSL_HOST: ios-cross
             IOS_SDK: WatchOS
             IOS_CPU: armv7k
-            test_ios: "yes"
-            config: "no"
-            make: "no"
-          - name: iPhoneSimulator on OS X, i386
-            os: macos-latest
-            AUTOTOOLS_HOST: i386-apple-ios
-            OPENSSL_HOST: iphoneos-cross
-            IOS_SDK: iPhoneSimulator
-            IOS_CPU: i386
             test_ios: "yes"
             config: "no"
             make: "no"
@@ -161,13 +144,44 @@ jobs:
             test_windows: "yes"
             config: "no"
             make: "no"
+          - name: FreeBSD
+            os: ubuntu-latest
+            config: "no"
+            make: "no"
+            with_cross_platform_action: "yes"
+            cross_platform_os: "freebsd"
+            cross_platform_arch: "x86-64"
+            cross_platform_version: "14.1"
+            cross_platform_config: "--enable-debug --disable-flto --with-libevent --disable-static"
+          - name: OpenBSD
+            os: ubuntu-latest
+            config: "no"
+            make: "no"
+            with_cross_platform_action: "yes"
+            cross_platform_os: "openbsd"
+            cross_platform_arch: "x86-64"
+            cross_platform_version: "7.5"
+            cross_platform_config: "--enable-debug --disable-flto --with-libevent --disable-static"
+          - name: NetBSD
+            os: ubuntu-latest
+            config: "no"
+            make: "no"
+            with_cross_platform_action: "yes"
+            cross_platform_os: "netbsd"
+            cross_platform_arch: "x86-64"
+            cross_platform_version: "10.0"
+            cross_platform_config: "--enable-debug --disable-flto --with-libevent --disable-static"
  
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
         with:
           submodules: false
+          persist-credentials: false
       - name: test_windows
         if: ${{ matrix.test_windows == 'yes' }}
+        env:
+          LIBEXPAT_FNAME: expat-2.7.0
+          LIBEXPAT_VERSION_DIR: R_2_7_0
         shell: bash
         run: |
           export unboundpath=`pwd`
@@ -175,25 +189,32 @@ jobs:
           cd ..
           export prepath=`pwd`
           echo prepath=${prepath}
-          #echo "curl cpanm"
-          #curl -L -k -s -S -o cpanm https://cpanmin.us/
-          #echo "perl cpanm Pod::Usage"
-          #perl cpanm Pod::Usage
+          # parralel build option
+          export MINJ="-j4"
+          echo "choco install winflexbison3"
+          choco install winflexbison3
+          echo 'LEX="win_flex"'
+          export LEX="win_flex"
+          echo 'YACC="win_bison -y"'
+          export YACC="win_bison -y"
           mkdir openssl
           echo "curl openssl"
-          curl -L -k -s -S -o openssl-1.1.1j.tar.gz https://www.openssl.org/source/openssl-1.1.1j.tar.gz
-          tar xzf openssl-1.1.1j.tar.gz
-          cd openssl-1.1.1j
+          curl -L -k -s -S -o openssl-3.2.0.tar.gz https://www.openssl.org/source/openssl-3.2.0.tar.gz
+          tar xzf openssl-3.2.0.tar.gz
+          cd openssl-3.2.0
           # remove pod::Usage because we do not need -help or -man output
-          # from the Configure script
-          echo "Fixup ./Configure by removing use Pod::Usage require"
-          sed -e 's/use Pod::Usage//' < Configure > Configure.fix
-          echo "./Configure.fix no-shared no-asm -DOPENSSL_NO_CAPIENG mingw64 --prefix=\""$prepath/openssl\"""
-          ./Configure.fix no-shared no-asm -DOPENSSL_NO_CAPIENG mingw64 --prefix="$prepath/openssl"
+          # from the Configure script, this fixes it for openssl 1.1.1
+          #echo "Fixup ./Configure by removing use Pod::Usage require"
+          #sed -e 's/use Pod::Usage//' < Configure > Configure.fix
+          # ./Configure.fix no-shared no-asm -DOPENSSL_NO_CAPIENG mingw64 --prefix="$prepath/openssl"
+          # pacman is used to install for msys2, with
+          # C:/msys64/usr/bin/pacman -S perl
+          echo "C:/msys64/usr/bin/perl ./Configure no-shared no-asm -DOPENSSL_NO_CAPIENG mingw64 --prefix=\""$prepath/openssl"\" PERL=\"C:/msys64/usr/bin/perl\""
+          C:/msys64/usr/bin/perl ./Configure no-shared no-asm -DOPENSSL_NO_CAPIENG mingw64 --prefix="$prepath/openssl" PERL="C:/msys64/usr/bin/perl"
           # make the libs only, build faster
           echo "make build_libs"
-          #make
-          make build_libs
+          #make $MINJ
+          make $MINJ build_libs
           mv Makefile Makefile.orig
           # fixup \\ in the installtop to /.
           echo "fixup INSTALLTOP"
@@ -205,9 +226,9 @@ jobs:
           cd ..
           mkdir expat
           echo "curl expat"
-          curl -L -k -s -S -o expat-2.2.10.tar.gz https://github.com/libexpat/libexpat/releases/download/R_2_2_10/expat-2.2.10.tar.gz
-          tar xzf expat-2.2.10.tar.gz
-          cd expat-2.2.10
+          curl -L -k -s -S -o $LIBEXPAT_FNAME.tar.gz https://github.com/libexpat/libexpat/releases/download/$LIBEXPAT_VERSION_DIR/$LIBEXPAT_FNAME.tar.gz
+          tar xzf $LIBEXPAT_FNAME.tar.gz
+          cd $LIBEXPAT_FNAME
           echo "./configure SHELL=/usr/bin/bash CONFIG_SHELL=/usr/bin/bash --prefix=\"$prepath/expat\" --exec-prefix=\"$prepath/expat\" --bindir=\"$prepath/expat/bin\" --includedir=\"$prepath/expat/include\" --mandir=\"$prepath/expat/man\" --libdir=\"$prepath/expat/lib\""
           ./configure SHELL=/usr/bin/bash CONFIG_SHELL=/usr/bin/bash --prefix="$prepath/expat" --exec-prefix="$prepath/expat" --bindir="$prepath/expat/bin" --includedir="$prepath/expat/include" --mandir="$prepath/expat/man" --libdir="$prepath/expat/lib"
           # fixup SHELL is treated specially, but SHELZZ is not by make.
@@ -225,7 +246,7 @@ jobs:
           mv xmlwf/Makefile xmlwf/Makefile.orig
           sed -e 's/SHELL/SHELLZZ/g' < xmlwf/Makefile.orig > xmlwf/Makefile
           echo "make"
-          make
+          make $MINJ
           echo "make install"
           make install
           cd ..
@@ -233,7 +254,7 @@ jobs:
           cd unbound
           echo "./configure --enable-debug --enable-static-exe --disable-flto \"--with-ssl=$prepath/openssl\" --with-libexpat=\"$prepath/expat\" --disable-shared"
           ./configure --enable-debug --enable-static-exe --disable-flto "--with-ssl=$prepath/openssl" --with-libexpat="$prepath/expat" --disable-shared
-          make
+          make $MINJ
           # specific test output
           #make testbound.exe; ./testbound.exe -s
           #make testbound; ./testbound.exe -p testdata/acl.rpl -o -vvvv
@@ -326,6 +347,33 @@ jobs:
           echo "::group::make install"
           make install
           echo "::endgroup::"
+      - name: cross-platform-action on ${{ matrix.cross_platform_os }} ${{ matrix.cross_platform_version }}
+        if: ${{ matrix.with_cross_platform_action == 'yes' }}
+        uses: cross-platform-actions/action@v1.0.0
+        env:
+          CROSS_PLATFORM_OS: ${{ matrix.cross_platform_os }}
+        with:
+          environment_variables: CROSS_PLATFORM_OS
+          operating_system: ${{ matrix.cross_platform_os }}
+          architecture: ${{ matrix.cross_platform_arch }}
+          version: ${{ matrix.cross_platform_version }}
+          shell: bash
+          memory: 4G
+          cpu_count: 2
+          run: |
+            set -e -x
+            if test "$CROSS_PLATFORM_OS" = "freebsd"; then sudo pkg install -y openssl libevent expat; fi
+            if test "$CROSS_PLATFORM_OS" = "openbsd"; then sudo pkg_add libevent; fi
+            if test "$CROSS_PLATFORM_OS" = "netbsd"; then sudo pkgin -y install libevent; fi
+            echo "::group::configure"
+            ./configure ${{ matrix.cross_platform_config }}
+            echo "::endgroup::"
+            echo "::group::make"
+            make
+            echo "::endgroup::"
+            echo "::group::make test"
+            make test
+            echo "::endgroup::"
       - name: install libevent
         if: ${{ matrix.install_libevent == 'yes' }}
         run: sudo apt-get install libevent-dev

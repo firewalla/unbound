@@ -105,6 +105,7 @@ respip_sockaddr_find_or_create(struct respip_set* set, struct sockaddr_storage* 
 		socklen_t addrlen, int net, int create, const char* ipstr)
 {
 	struct resp_addr* node;
+	log_assert(set);
 	node = (struct resp_addr*)addr_tree_find(&set->ip_tree, addr, addrlen, net);
 	if(!node && create) {
 		node = regional_alloc_zero(set->region, sizeof(*node));
@@ -128,6 +129,7 @@ void
 respip_sockaddr_delete(struct respip_set* set, struct resp_addr* node)
 {
 	struct resp_addr* prev;
+	log_assert(set);
 	prev = (struct resp_addr*)rbtree_previous((struct rbnode_type*)node);	
 	lock_rw_destroy(&node->lock);
 	(void)rbtree_delete(&set->ip_tree, node);
@@ -146,6 +148,7 @@ respip_find_or_create(struct respip_set* set, const char* ipstr, int create)
 	struct sockaddr_storage addr;
 	int net;
 	socklen_t addrlen;
+	log_assert(set);
 
 	if(!netblockstrtoaddr(ipstr, 0, &addr, &addrlen, &net)) {
 		log_err("cannot parse netblock: '%s'", ipstr);
@@ -160,6 +163,7 @@ respip_tag_cfg(struct respip_set* set, const char* ipstr,
 	const uint8_t* taglist, size_t taglen)
 {
 	struct resp_addr* node;
+	log_assert(set);
 
 	if(!(node=respip_find_or_create(set, ipstr, 1)))
 		return 0;
@@ -183,6 +187,7 @@ respip_action_cfg(struct respip_set* set, const char* ipstr,
 {
 	struct resp_addr* node;
 	enum respip_action action;
+	log_assert(set);
 
 	if(!(node=respip_find_or_create(set, ipstr, 1)))
 		return 0;
@@ -325,6 +330,7 @@ static int
 respip_data_cfg(struct respip_set* set, const char* ipstr, const char* rrstr)
 {
 	struct resp_addr* node;
+	log_assert(set);
 
 	node=respip_find_or_create(set, ipstr, 0);
 	if(!node || node->action == respip_none) {
@@ -344,6 +350,7 @@ respip_set_apply_cfg(struct respip_set* set, char* const* tagname, int num_tags,
 	struct config_strbytelist* p;
 	struct config_str2list* pa;
 	struct config_str2list* pd;
+	log_assert(set);
 
 	set->tagname = tagname;
 	set->num_tags = num_tags;
@@ -609,6 +616,7 @@ respip_addr_lookup(const struct reply_info *rep, struct respip_set* rs,
 	struct resp_addr* ra;
 	struct sockaddr_storage ss;
 	socklen_t addrlen;
+	log_assert(rs);
 
 	lock_rw_rdlock(&rs->lock);
 	for(i=0; i<rep->an_numrrsets; i++) {
@@ -833,8 +841,11 @@ static int
 respip_use_rpz(struct resp_addr* raddr, struct rpz* r,
 	enum respip_action* action,
 	struct ub_packed_rrset_key** data, int* rpz_log, char** log_name,
-	int* rpz_cname_override, struct regional* region, int* is_rpz)
+	int* rpz_cname_override, struct regional* region, int* is_rpz,
+	int* rpz_passthru)
 {
+	if(rpz_passthru && *rpz_passthru)
+		return 0;
 	if(r->action_override == RPZ_DISABLED_ACTION) {
 		*is_rpz = 0;
 		return 1;
@@ -848,6 +859,9 @@ respip_use_rpz(struct resp_addr* raddr, struct rpz* r,
 		*data = r->cname_override;
 		*rpz_cname_override = 1;
 	}
+	if(*action == respip_always_transparent /* RPZ_PASSTHRU_ACTION */
+		&& rpz_passthru)
+		*rpz_passthru = 1;
 	*rpz_log = r->log;
 	if(r->log_name)
 		if(!(*log_name = regional_strdup(region, r->log_name)))
@@ -861,7 +875,8 @@ respip_rewrite_reply(const struct query_info* qinfo,
 	const struct respip_client_info* cinfo, const struct reply_info* rep,
 	struct reply_info** new_repp, struct respip_action_info* actinfo,
 	struct ub_packed_rrset_key** alias_rrset, int search_only,
-	struct regional* region, struct auth_zones* az)
+	struct regional* region, struct auth_zones* az, int* rpz_passthru,
+	struct views* views, struct respip_set* ipset)
 {
 	const uint8_t* ctaglist;
 	size_t ctaglen;
@@ -870,7 +885,6 @@ respip_rewrite_reply(const struct query_info* qinfo,
 	struct config_strlist** tag_datas;
 	size_t tag_datas_size;
 	struct view* view = NULL;
-	struct respip_set* ipset = NULL;
 	size_t rrset_id = 0, rr_id = 0;
 	enum respip_action action = respip_none;
 	int tag = -1;
@@ -893,8 +907,20 @@ respip_rewrite_reply(const struct query_info* qinfo,
 	tag_actions_size = cinfo->tag_actions_size;
 	tag_datas = cinfo->tag_datas;
 	tag_datas_size = cinfo->tag_datas_size;
-	view = cinfo->view;
-	ipset = cinfo->respip_set;
+	if(cinfo->view) {
+		view = cinfo->view;
+		lock_rw_rdlock(&view->lock);
+	} else if(cinfo->view_name) {
+		view = views_find_view(views, cinfo->view_name, 0);
+		if(!view) {
+			/* If the view no longer exists, the rewrite can not
+			 * be processed further. */
+			verbose(VERB_ALGO, "respip: failed because view %s no "
+				"longer exists", cinfo->view_name);
+			return 0;
+		}
+		/* The view is rdlocked by views_find_view. */
+	}
 
 	log_assert(ipset);
 
@@ -909,7 +935,6 @@ respip_rewrite_reply(const struct query_info* qinfo,
 	  * Note also that we assume 'view' is valid in this function, which
 	  * should be safe (see unbound bug #1191) */
 	if(view) {
-		lock_rw_rdlock(&view->lock);
 		if(view->respip_set) {
 			if((raddr = respip_addr_lookup(rep,
 				view->respip_set, &rrset_id, &rr_id))) {
@@ -934,7 +959,7 @@ respip_rewrite_reply(const struct query_info* qinfo,
 			ipset->tagname, ipset->num_tags);
 	}
 	lock_rw_rdlock(&az->rpz_lock);
-	for(a = az->rpz_first; a && !raddr; a = a->rpz_az_next) {
+	for(a = az->rpz_first; a && !raddr && !(rpz_passthru && *rpz_passthru); a = a->rpz_az_next) {
 		lock_rw_rdlock(&a->lock);
 		r = a->rpz;
 		if(!r->taglist || taglist_intersect(r->taglist, 
@@ -943,11 +968,14 @@ respip_rewrite_reply(const struct query_info* qinfo,
 				r->respip_set, &rrset_id, &rr_id))) {
 				if(!respip_use_rpz(raddr, r, &action, &data,
 					&rpz_log, &log_name, &rpz_cname_override,
-					region, &rpz_used)) {
+					region, &rpz_used, rpz_passthru)) {
 					log_err("out of memory");
 					lock_rw_unlock(&raddr->lock);
 					lock_rw_unlock(&a->lock);
 					lock_rw_unlock(&az->rpz_lock);
+					if(view) {
+                    	lock_rw_unlock(&view->lock);
+					}
 					return 0;
 				}
 				if(rpz_used) {
@@ -955,7 +983,7 @@ respip_rewrite_reply(const struct query_info* qinfo,
 						struct sockaddr_storage ss;
 						socklen_t ss_len = 0;
 						char nm[256], ip[256];
-						char qn[255+1];
+						char qn[LDNS_MAX_DOMAINLEN];
 						if(!rdata2sockaddr(rep->rrsets[rrset_id]->entry.data, ntohs(rep->rrsets[rrset_id]->rk.type), rr_id, &ss, &ss_len))
 							snprintf(ip, sizeof(ip), "invalidRRdata");
 						else
@@ -964,7 +992,7 @@ respip_rewrite_reply(const struct query_info* qinfo,
 						addr_to_str(&raddr->node.addr,
 							raddr->node.addrlen,
 							nm, sizeof(nm));
-						verbose(VERB_ALGO, "respip: rpz response-ip trigger %s/%d on %s %s with action %s", nm, raddr->node.net, qn, ip, rpz_action_to_string(respip_action_to_rpz_action(action)));
+						verbose(VERB_ALGO, "respip: rpz: response-ip trigger %s/%d on %s %s with action %s", nm, raddr->node.net, qn, ip, rpz_action_to_string(respip_action_to_rpz_action(action)));
 					}
 					/* break to make sure 'a' stays pointed
 					 * to used auth_zone, and keeps lock */
@@ -1049,7 +1077,8 @@ generate_cname_request(struct module_qstate* qstate,
 	subqi.qtype = qstate->qinfo.qtype;
 	subqi.qclass = qstate->qinfo.qclass;
 	fptr_ok(fptr_whitelist_modenv_attach_sub(qstate->env->attach_sub));
-	return (*qstate->env->attach_sub)(qstate, &subqi, BIT_RD, 0, 0, &subq);
+	return (*qstate->env->attach_sub)(qstate, &subqi,
+		qstate->client_info, BIT_RD, 0, 0, &subq);
 }
 
 void
@@ -1085,7 +1114,13 @@ respip_operate(struct module_qstate* qstate, enum module_ev event, int id,
 		if((qstate->qinfo.qtype == LDNS_RR_TYPE_A ||
 			qstate->qinfo.qtype == LDNS_RR_TYPE_AAAA ||
 			qstate->qinfo.qtype == LDNS_RR_TYPE_ANY) &&
-			qstate->return_msg && qstate->return_msg->rep) {
+			qstate->return_msg && qstate->return_msg->rep &&
+			!(qstate->env->need_to_validate &&
+			  (!(qstate->query_flags & BIT_CD)
+			    || qstate->env->cfg->ignore_cd) &&
+			  (qstate->return_msg->rep->security <= sec_status_bogus
+			    || qstate->return_msg->rep->security ==
+			    sec_status_secure_sentinel_fail))) {
 			struct reply_info* new_rep = qstate->return_msg->rep;
 			struct ub_packed_rrset_key* alias_rrset = NULL;
 			struct respip_action_info actinfo = {0, 0, 0, 0, NULL, 0, NULL};
@@ -1094,7 +1129,9 @@ respip_operate(struct module_qstate* qstate, enum module_ev event, int id,
 			if(!respip_rewrite_reply(&qstate->qinfo,
 				qstate->client_info, qstate->return_msg->rep,
 				&new_rep, &actinfo, &alias_rrset, 0,
-				qstate->region, qstate->env->auth_zones)) {
+				qstate->region, qstate->env->auth_zones,
+				&qstate->rpz_passthru, qstate->env->views,
+				qstate->env->respip_set)) {
 				goto servfail;
 			}
 			if(actinfo.action != respip_none) {
@@ -1142,7 +1179,8 @@ respip_merge_cname(struct reply_info* base_rep,
 	const struct query_info* qinfo, const struct reply_info* tgt_rep,
 	const struct respip_client_info* cinfo, int must_validate,
 	struct reply_info** new_repp, struct regional* region,
-	struct auth_zones* az)
+	struct auth_zones* az, struct views* views,
+	struct respip_set* respip_set)
 {
 	struct reply_info* new_rep;
 	struct reply_info* tmp_rep = NULL; /* just a placeholder */
@@ -1169,7 +1207,7 @@ respip_merge_cname(struct reply_info* base_rep,
 
 	/* see if the target reply would be subject to a response-ip action. */
 	if(!respip_rewrite_reply(qinfo, cinfo, tgt_rep, &tmp_rep, &actinfo,
-		&alias_rrset, 1, region, az))
+		&alias_rrset, 1, region, az, NULL, views, respip_set))
 		return 0;
 	if(actinfo.action != respip_none) {
 		log_info("CNAME target of redirect response-ip action would "
@@ -1205,7 +1243,8 @@ respip_inform_super(struct module_qstate* qstate, int id,
 	struct respip_qstate* rq = (struct respip_qstate*)super->minfo[id];
 	struct reply_info* new_rep = NULL;
 
-	rq->state = RESPIP_SUBQUERY_FINISHED;
+	if(rq)
+		rq->state = RESPIP_SUBQUERY_FINISHED;
 
 	/* respip subquery should have always been created with a valid reply
 	 * in super. */
@@ -1222,7 +1261,8 @@ respip_inform_super(struct module_qstate* qstate, int id,
 	if(!respip_merge_cname(super->return_msg->rep, &qstate->qinfo,
 		qstate->return_msg->rep, super->client_info,
 		super->env->need_to_validate, &new_rep, super->region,
-		qstate->env->auth_zones))
+		qstate->env->auth_zones, qstate->env->views,
+		qstate->env->respip_set))
 		goto fail;
 	super->return_msg->rep = new_rep;
 	return;
@@ -1252,8 +1292,8 @@ respip_get_mem(struct module_env* env, int id)
  */
 static struct module_func_block respip_block = {
 	"respip",
-	&respip_init, &respip_deinit, &respip_operate, &respip_inform_super,
-	&respip_clear, &respip_get_mem
+	NULL, NULL, &respip_init, &respip_deinit, &respip_operate,
+	&respip_inform_super, &respip_clear, &respip_get_mem
 };
 
 struct module_func_block*
@@ -1283,7 +1323,7 @@ respip_set_is_empty(const struct respip_set* set)
 void
 respip_inform_print(struct respip_action_info* respip_actinfo, uint8_t* qname,
 	uint16_t qtype, uint16_t qclass, struct local_rrset* local_alias,
-	struct comm_reply* repinfo)
+	struct sockaddr_storage* addr, socklen_t addrlen)
 {
 	char srcip[128], respip[128], txt[512];
 	unsigned port;
@@ -1293,15 +1333,15 @@ respip_inform_print(struct respip_action_info* respip_actinfo, uint8_t* qname,
 
 	if(local_alias)
 		qname = local_alias->rrset->rk.dname;
-	port = (unsigned)((repinfo->addr.ss_family == AF_INET) ?
-		ntohs(((struct sockaddr_in*)&repinfo->addr)->sin_port) :
-		ntohs(((struct sockaddr_in6*)&repinfo->addr)->sin6_port));
-	addr_to_str(&repinfo->addr, repinfo->addrlen, srcip, sizeof(srcip));
+	port = (unsigned)((addr->ss_family == AF_INET) ?
+		ntohs(((struct sockaddr_in*)addr)->sin_port) :
+		ntohs(((struct sockaddr_in6*)addr)->sin6_port));
+	addr_to_str(addr, addrlen, srcip, sizeof(srcip));
 	addr_to_str(&respip_addr->addr, respip_addr->addrlen,
 		respip, sizeof(respip));
 	if(respip_actinfo->rpz_log) {
 		txtlen += snprintf(txt+txtlen, sizeof(txt)-txtlen, "%s",
-			"RPZ applied ");
+			"rpz: applied ");
 		if(respip_actinfo->rpz_cname_override)
 			actionstr = rpz_action_to_string(
 				RPZ_CNAME_OVERRIDE_ACTION);
@@ -1318,4 +1358,36 @@ respip_inform_print(struct respip_action_info* respip_actinfo, uint8_t* qname,
 		"%s/%d %s %s@%u", respip, respip_addr->net,
 		(actionstr) ? actionstr : "inform", srcip, port);
 	log_nametypeclass(NO_VERBOSE, txt, qname, qtype, qclass);
+}
+
+size_t respip_set_get_mem(struct respip_set* set)
+{
+	size_t m;
+	if(!set) return 0;
+	m = sizeof(*set);
+	lock_rw_rdlock(&set->lock);
+	m += regional_get_mem(set->region);
+	lock_rw_unlock(&set->lock);
+	return m;
+}
+
+void
+respip_set_swap_tree(struct respip_set* respip_set,
+	struct respip_set* data)
+{
+	rbnode_type* oldroot = respip_set->ip_tree.root;
+	size_t oldcount = respip_set->ip_tree.count;
+	struct regional* oldregion = respip_set->region;
+	char* const* oldtagname = respip_set->tagname;
+	int oldnum_tags = respip_set->num_tags;
+	respip_set->ip_tree.root = data->ip_tree.root;
+	respip_set->ip_tree.count = data->ip_tree.count;
+	respip_set->region = data->region;
+	respip_set->tagname = data->tagname;
+	respip_set->num_tags = data->num_tags;
+	data->ip_tree.root = oldroot;
+	data->ip_tree.count = oldcount;
+	data->region = oldregion;
+	data->tagname = oldtagname;
+	data->num_tags = oldnum_tags;
 }

@@ -124,7 +124,7 @@ uint16_t sldns_calc_keytag_raw(uint8_t* key, size_t keysize)
 		size_t i;
 		uint32_t ac32 = 0;
 		for (i = 0; i < keysize; ++i) {
-			ac32 += (i & 1) ? key[i] : key[i] << 8;
+			ac32 += ((i & 1)) ? key[i] : key[i] << 8;
 		}
 		ac32 += (ac32 >> 16) & 0xFFFF;
 		return (uint16_t) (ac32 & 0xFFFF);
@@ -195,6 +195,7 @@ void sldns_key_EVP_unload_gost(void)
 }
 #endif /* USE_GOST */
 
+#ifdef USE_DSA
 /* Retrieve params as BIGNUM from raw buffer */
 static int
 sldns_key_dsa_buf_bignum(unsigned char* key, size_t len, BIGNUM** p,
@@ -250,7 +251,8 @@ sldns_key_buf2dsa_raw(unsigned char* key, size_t len)
 	if(!(dsa = DSA_new())) {
 		return NULL;
 	}
-#if OPENSSL_VERSION_NUMBER < 0x10100000 || defined(HAVE_LIBRESSL)
+#if OPENSSL_VERSION_NUMBER < 0x10100000 || \
+        (defined(HAVE_LIBRESSL) && LIBRESSL_VERSION_NUMBER < 0x02070000f)
 #ifndef S_SPLINT_S
 	dsa->p = P;
 	dsa->q = Q;
@@ -270,7 +272,7 @@ sldns_key_buf2dsa_raw(unsigned char* key, size_t len)
 		return NULL;
 	}
 	if (!DSA_set0_key(dsa, Y, NULL)) {
-		/* QPG attached, cleaned up by DSA_fre() */
+		/* QPG attached, cleaned up by DSA_free() */
 		DSA_free(dsa);
 		BN_free(Y);
 		return NULL;
@@ -369,6 +371,7 @@ EVP_PKEY *sldns_key_dsa2pkey_raw(unsigned char* key, size_t len)
 	return evp_key;
 #endif
 }
+#endif /* USE_DSA */
 
 /* Retrieve params as BIGNUM from raw buffer, n is modulus, e is exponent */
 static int
@@ -428,7 +431,8 @@ sldns_key_buf2rsa_raw(unsigned char* key, size_t len)
 		BN_free(modulus);
 		return NULL;
 	}
-#if OPENSSL_VERSION_NUMBER < 0x10100000 || defined(HAVE_LIBRESSL)
+#if OPENSSL_VERSION_NUMBER < 0x10100000 || \
+        (defined(HAVE_LIBRESSL) && LIBRESSL_VERSION_NUMBER < 0x02070000f)
 #ifndef S_SPLINT_S
 	rsa->n = modulus;
 	rsa->e = exponent;

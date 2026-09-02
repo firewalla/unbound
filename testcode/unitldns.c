@@ -172,10 +172,14 @@ rr_test_file(const char* input, const char* check)
 		if(txt_in[0] == 0 || txt_in[0] == '\n' || txt_in[0] == ';')
 			continue;
 		/* read check lines */
-		if(!fgets(wire_chk, (int)bufs, chf))
+		if(!fgets(wire_chk, (int)bufs, chf)) {
 			printf("%s too short\n", check);
-		if(!fgets(txt_chk, (int)bufs, chf))
+			unit_assert(0);
+		}
+		if(!fgets(txt_chk, (int)bufs, chf)) {
 			printf("%s too short\n", check);
+			unit_assert(0);
+		}
 		chlineno += 2;
 		if(vbmp) printf("%s:%d %s", check, chlineno-1, wire_chk);
 		if(vbmp) printf("%s:%d %s", check, chlineno, txt_chk);
@@ -203,7 +207,11 @@ rr_test_file(const char* input, const char* check)
 #define xstr(s) str(s)
 #define str(s) #s
 
+#ifndef __QNX__
 #define SRCDIRSTR xstr(SRCDIR)
+#else /* !__QNX__ */
+#define SRCDIRSTR "."
+#endif /* __QNX__ */
 
 /** read rrs to and from string, to and from wireformat */
 static void
@@ -243,28 +251,28 @@ b64_test(void)
 
 	memset(target, 0, sizeof(target));
 	result = sldns_b64_pton(p1, (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello") && strcmp(target, "hello") == 0);
+	unit_assert(result == (int)strlen("hello") && strcmp(target, "hello") == 0);
 	memset(target, 0, sizeof(target));
 	result = sldns_b64_pton(p2, (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello>") && strcmp(target, "hello>") == 0);
+	unit_assert(result == (int)strlen("hello>") && strcmp(target, "hello>") == 0);
 	memset(target, 0, sizeof(target));
 	result = sldns_b64_pton(p3, (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello?!") && strcmp(target, "hello?!") == 0);
+	unit_assert(result == (int)strlen("hello?!") && strcmp(target, "hello?!") == 0);
 	memset(target, 0, sizeof(target));
 	result = sldns_b64_pton(p4, (uint8_t*)target, tarsize);
 	/* when padding is used everything that is not a block of 4 will be
 	 * ignored */
-	unit_assert(result == strlen("hel") && strcmp(target, "hel") == 0);
+	unit_assert(result == (int)strlen("hel") && strcmp(target, "hel") == 0);
 
 	memset(target, 0, sizeof(target));
 	result = sldns_b64url_pton(u1, strlen(u1), (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello") && strcmp(target, "hello") == 0);
+	unit_assert(result == (int)strlen("hello") && strcmp(target, "hello") == 0);
 	memset(target, 0, sizeof(target));
 	result = sldns_b64url_pton(u2, strlen(u2), (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello>") && strcmp(target, "hello>") == 0);
+	unit_assert(result == (int)strlen("hello>") && strcmp(target, "hello>") == 0);
 	memset(target, 0, sizeof(target));
 	result = sldns_b64url_pton(u3, strlen(u3), (uint8_t*)target, tarsize);
-	unit_assert(result == strlen("hello+/") && strcmp(target, "hello?!") == 0);
+	unit_assert(result == (int)strlen("hello+/") && strcmp(target, "hello?!") == 0);
 	/* one item in block of four is not allowed */
 	memset(target, 0, sizeof(target));
 	result = sldns_b64url_pton(u4, strlen(u4), (uint8_t*)target, tarsize);

@@ -86,6 +86,20 @@
      }
      return list;
    }
+
+   /* converts an array of strings (char**) to a List of strings */
+   PyObject* CharArrayAsStringList(char** array, int len) {
+     PyObject* list;
+     int i;
+
+     if(!array||len==0) return PyList_New(0);
+
+     list = PyList_New(len);
+     for (i=0; i < len; i++) {
+            PyList_SET_ITEM(list, i, PyString_FromString(array[i]));
+     }
+     return list;
+   }
 %}
 
 /* ************************************************************************************ *
@@ -190,7 +204,7 @@ struct query_info {
 
 %inline %{
    PyObject* dnameAsStr(PyObject* dname) {
-       char buf[LDNS_MAX_DOMAINLEN+1];
+       char buf[LDNS_MAX_DOMAINLEN];
        buf[0] = '\0';
        dname_str((uint8_t*)PyBytes_AsString(dname), buf);
        return PyString_FromString(buf);
@@ -609,9 +623,9 @@ struct mesh_reply {
    struct comm_reply query_reply;
 };
 
-%rename(_addr) comm_reply::addr;
+%rename(_addr) comm_reply::client_addr;
 struct comm_reply {
-   struct sockaddr_storage addr;
+   struct sockaddr_storage client_addr;
 };
 
 %extend comm_reply {
@@ -712,13 +726,14 @@ struct module_env {
     /* --- services --- */
     struct outbound_entry* (*send_query)(struct query_info* qinfo,
         uint16_t flags, int dnssec, int want_dnssec, int nocaps,
+        int check_ratelimit,
         struct sockaddr_storage* addr, socklen_t addrlen,
         uint8_t* zone, size_t zonelen, int tcp_upstream, int ssl_upstream,
-        char* tls_auth_name, struct module_qstate* q);
+        char* tls_auth_name, struct module_qstate* q, int* was_ratelimited);
     void (*detach_subs)(struct module_qstate* qstate);
     int (*attach_sub)(struct module_qstate* qstate,
-        struct query_info* qinfo, uint16_t qflags, int prime,
-        int valrec, struct module_qstate** newq);
+        struct query_info* qinfo, struct respip_client_info* cinfo,
+        uint16_t qflags, int prime, int valrec, struct module_qstate** newq);
     void (*kill_sub)(struct module_qstate* newq);
     int (*detect_cycle)(struct module_qstate* qstate,
         struct query_info* qinfo, uint16_t flags, int prime,
@@ -951,6 +966,9 @@ struct config_str2list {
 /* ************************************************************************************ *
    Structure config_file
  * ************************************************************************************ */
+%ignore config_file::ifs;
+%ignore config_file::out_ifs;
+%ignore config_file::python_script;
 struct config_file {
    int verbosity;
    int stat_interval;
@@ -991,6 +1009,7 @@ struct config_file {
    int harden_short_bufsize;
    int harden_large_queries;
    int harden_glue;
+   int harden_unverified_glue;
    int harden_dnssec_stripped;
    int harden_referral_path;
    int use_caps_bits_for_id;
@@ -1033,6 +1052,25 @@ struct config_file {
    int do_daemonize;
    struct config_strlist* python_script;
 };
+
+%inline %{
+   PyObject* _get_ifs_tuple(struct config_file* cfg) {
+      return CharArrayAsStringList(cfg->ifs, cfg->num_ifs);
+   }
+   PyObject* _get_ifs_out_tuple(struct config_file* cfg) {
+      return CharArrayAsStringList(cfg->out_ifs, cfg->num_out_ifs);
+   }
+%}
+
+%extend config_file {
+   %pythoncode %{
+        ifs = property(_unboundmodule._get_ifs_tuple)
+        out_ifs = property(_unboundmodule._get_ifs_out_tuple)
+
+        def _deprecated_python_script(self): return "cfg.python_script is deprecated, you can use `mod_env['script']` instead."
+        python_script = property(_deprecated_python_script)
+   %}
+}
 
 /* ************************************************************************************ *
    ASN: Adding structures related to forwards_lookup and dns_cache_find_delegation
@@ -1374,11 +1412,12 @@ int set_return_msg(struct module_qstate* qstate,
 /* Functions which we will need to lookup delegations */
 struct delegpt* dns_cache_find_delegation(struct module_env* env,
         uint8_t* qname, size_t qnamelen, uint16_t qtype, uint16_t qclass,
-        struct regional* region, struct dns_msg** msg, uint32_t timenow);
+        struct regional* region, struct dns_msg** msg, uint32_t timenow,
+        int noexpiredabove, uint8_t* expiretop, size_t expiretoplen);
 int iter_dp_is_useless(struct query_info* qinfo, uint16_t qflags,
-        struct delegpt* dp);
+        struct delegpt* dp, int supports_ipv4, int supports_ipv6, int use_nat64);
 struct iter_hints_stub* hints_lookup_stub(struct iter_hints* hints,
-        uint8_t* qname, uint16_t qclass, struct delegpt* dp);
+        uint8_t* qname, uint16_t qclass, struct delegpt* dp, int nolock);
 
 /* Custom function to perform logic similar to the one in daemon/cachedump.c */
 struct delegpt* find_delegation(struct module_qstate* qstate, char *nm, size_t nmlen);
@@ -1395,6 +1434,7 @@ struct delegpt* find_delegation(struct module_qstate* qstate, char *nm, size_t n
     struct query_info qinfo;
     struct iter_hints_stub* stub;
     uint32_t timenow = *qstate->env->now;
+    int nolock = 0;
 
     regional_free_all(region);
     qinfo.qname = (uint8_t*)nm;
@@ -1403,10 +1443,12 @@ struct delegpt* find_delegation(struct module_qstate* qstate, char *nm, size_t n
     qinfo.qclass = LDNS_RR_CLASS_IN;
 
     while(1) {
-        dp = dns_cache_find_delegation(qstate->env, (uint8_t*)nm, nmlen, qinfo.qtype, qinfo.qclass, region, &msg, timenow);
+        dp = dns_cache_find_delegation(qstate->env, (uint8_t*)nm, nmlen, qinfo.qtype, qinfo.qclass, region, &msg, timenow, 0, NULL, 0);
         if(!dp)
             return NULL;
-        if(iter_dp_is_useless(&qinfo, BIT_RD, dp)) {
+        if(iter_dp_is_useless(&qinfo, BIT_RD, dp,
+                qstate->env->cfg->do_ip4, qstate->env->cfg->do_ip6,
+                qstate->env->cfg->do_nat64)) {
             if (dname_is_root((uint8_t*)nm))
                 return NULL;
             nm = (char*)dp->name;
@@ -1415,9 +1457,12 @@ struct delegpt* find_delegation(struct module_qstate* qstate, char *nm, size_t n
             dname_str((uint8_t*)nm, b);
             continue;
         }
-        stub = hints_lookup_stub(qstate->env->hints, qinfo.qname, qinfo.qclass, dp);
+        stub = hints_lookup_stub(qstate->env->hints, qinfo.qname,
+            qinfo.qclass, dp, nolock);
         if (stub) {
-            return stub->dp;
+            struct delegpt* stubdp = delegpt_copy(stub->dp, region);
+            lock_rw_unlock(&qstate->env->hints->lock);
+            return stubdp;
         } else {
             return dp;
         }
@@ -1547,13 +1592,15 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         struct comm_reply* repinfo, struct regional* region,
         struct timeval* start_time, int id, void* python_callback)
     {
-        PyObject *func, *py_edns, *py_qstate, *py_opt_list_out, *py_qinfo;
-        PyObject *py_rep, *py_repinfo, *py_region;
+        PyObject *func = NULL, *py_edns = NULL, *py_qstate = NULL;
+        PyObject *py_opt_list_out = NULL, *py_qinfo = NULL;
+        PyObject *py_rep = NULL, *py_repinfo = NULL, *py_region = NULL;
         PyObject *py_args = NULL, *py_kwargs = NULL, *result = NULL;
         int res = 0;
         double py_start_time = ((double)start_time->tv_sec) + ((double)start_time->tv_usec) / 1.0e6;
 
         PyGILState_STATE gstate = PyGILState_Ensure();
+
         func = (PyObject *) python_callback;
         py_edns = SWIG_NewPointerObj((void*) edns, SWIGTYPE_p_edns_data, 0);
         py_qstate = SWIG_NewPointerObj((void*) qstate,
@@ -1564,20 +1611,24 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         py_rep = SWIG_NewPointerObj((void*) rep, SWIGTYPE_p_reply_info, 0);
         py_repinfo = SWIG_NewPointerObj((void*) repinfo, SWIGTYPE_p_comm_reply, 0);
         py_region = SWIG_NewPointerObj((void*) region, SWIGTYPE_p_regional, 0);
-        if(py_qinfo && py_qstate && py_rep && py_edns && py_opt_list_out
-                && py_region && py_repinfo) {
-                py_args = Py_BuildValue("(OOOiOOO)", py_qinfo, py_qstate, py_rep,
-                        rcode, py_edns, py_opt_list_out, py_region);
-                py_kwargs = Py_BuildValue("{s:O,s:d}", "repinfo", py_repinfo, "start_time",
-                          py_start_time);
-                if(py_args && py_kwargs) {
-                        result = PyObject_Call(func, py_args, py_kwargs);
-                } else {
-                        log_err("pythonmod: malloc failure in python_inplace_cb_reply_generic");
-                }
-        } else {
-                log_err("pythonmod: malloc failure in python_inplace_cb_reply_generic");
+        if(!(py_qinfo && py_qstate && py_rep && py_edns && py_opt_list_out
+                && py_region && py_repinfo)) {
+                log_err("pythonmod: swig pointer failure in python_inplace_cb_reply_generic");
+                goto out;
         }
+        py_args = Py_BuildValue("(OOOiOOO)", py_qinfo, py_qstate, py_rep,
+                rcode, py_edns, py_opt_list_out, py_region);
+        py_kwargs = Py_BuildValue("{s:O,s:d}", "repinfo", py_repinfo, "start_time",
+                py_start_time);
+        if(!(py_args && py_kwargs)) {
+                log_err("pythonmod: BuildValue failure in python_inplace_cb_reply_generic");
+                goto out;
+        }
+        result = PyObject_Call(func, py_args, py_kwargs);
+        if (result) {
+            res = PyInt_AsLong(result);
+        }
+out:
         Py_XDECREF(py_edns);
         Py_XDECREF(py_qstate);
         Py_XDECREF(py_opt_list_out);
@@ -1587,9 +1638,6 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         Py_XDECREF(py_region);
         Py_XDECREF(py_args);
         Py_XDECREF(py_kwargs);
-        if (result) {
-            res = PyInt_AsLong(result);
-        }
         Py_XDECREF(result);
         PyGILState_Release(gstate);
         return res;
@@ -1637,29 +1685,34 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         int res = 0;
         PyObject *func = python_callback;
         PyObject *py_args = NULL, *py_kwargs = NULL, *result = NULL;
+        PyObject *py_qinfo = NULL;
+        PyObject *py_qstate = NULL;
+        PyObject *py_addr = NULL;
+        PyObject *py_zone = NULL;
+        PyObject *py_region = NULL;
 
         PyGILState_STATE gstate = PyGILState_Ensure();
 
-        PyObject *py_qinfo = SWIG_NewPointerObj((void*) qinfo, SWIGTYPE_p_query_info, 0);
-        PyObject *py_qstate = SWIG_NewPointerObj((void*) qstate, SWIGTYPE_p_module_qstate, 0);
-        PyObject *py_addr = SWIG_NewPointerObj((void *) addr, SWIGTYPE_p_sockaddr_storage, 0);
-        PyObject *py_zone = PyBytes_FromStringAndSize((const char *)zone, zonelen);
-        PyObject *py_region = SWIG_NewPointerObj((void*) region, SWIGTYPE_p_regional, 0);
-        if(py_qinfo && py_qstate && py_addr && py_zone && py_region) {
-                py_args = Py_BuildValue("(OiOOOO)", py_qinfo, flags, py_qstate, py_addr, py_zone, py_region);
-                py_kwargs = Py_BuildValue("{}");
-                if(py_args && py_kwargs) {
-                        result = PyObject_Call(func, py_args, py_kwargs);
-                        if (result) {
-                            res = PyInt_AsLong(result);
-                        }
-                } else {
-                        log_err("pythonmod: malloc failure in python_inplace_cb_query_generic");
-                }
-        } else {
-                log_err("pythonmod: malloc failure in python_inplace_cb_query_generic");
+        py_qinfo = SWIG_NewPointerObj((void*) qinfo, SWIGTYPE_p_query_info, 0);
+        py_qstate = SWIG_NewPointerObj((void*) qstate, SWIGTYPE_p_module_qstate, 0);
+        py_addr = SWIG_NewPointerObj((void *) addr, SWIGTYPE_p_sockaddr_storage, 0);
+        py_zone = PyBytes_FromStringAndSize((const char *)zone, zonelen);
+        py_region = SWIG_NewPointerObj((void*) region, SWIGTYPE_p_regional, 0);
+        if(!(py_qinfo && py_qstate && py_addr && py_zone && py_region)) {
+                log_err("pythonmod: swig pointer failure in python_inplace_cb_query_generic");
+                goto out;
         }
-
+        py_args = Py_BuildValue("(OiOOOO)", py_qinfo, flags, py_qstate, py_addr, py_zone, py_region);
+        py_kwargs = Py_BuildValue("{}");
+        if(!(py_args && py_kwargs)) {
+                log_err("pythonmod: BuildValue failure in python_inplace_cb_query_generic");
+                goto out;
+        }
+        result = PyObject_Call(func, py_args, py_kwargs);
+        if (result) {
+            res = PyInt_AsLong(result);
+        }
+out:
         Py_XDECREF(py_qinfo);
         Py_XDECREF(py_qstate);
         Py_XDECREF(py_addr);
@@ -1683,6 +1736,105 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         if (ret) Py_INCREF(py_cb);
         return ret;
     }
+
+    int python_inplace_cb_query_response(struct module_qstate* qstate,
+        struct dns_msg* response, int id, void* python_callback)
+    {
+        int res = 0;
+        PyObject *func = python_callback;
+        PyObject *py_qstate = NULL;
+        PyObject *py_response = NULL;
+        PyObject *py_args = NULL;
+        PyObject *py_kwargs = NULL;
+        PyObject *result = NULL;
+
+        PyGILState_STATE gstate = PyGILState_Ensure();
+
+        py_qstate = SWIG_NewPointerObj((void*) qstate, SWIGTYPE_p_module_qstate, 0);
+        py_response = SWIG_NewPointerObj((void*) response, SWIGTYPE_p_dns_msg, 0);
+        if(!(py_qstate && py_response)) {
+                log_err("pythonmod: swig pointer failure in python_inplace_cb_query_response");
+                goto out;
+        }
+        py_args = Py_BuildValue("(OO)", py_qstate, py_response);
+        py_kwargs = Py_BuildValue("{}");
+        if(!(py_args && py_kwargs)) {
+                log_err("pythonmod: BuildValue failure in python_inplace_cb_query_response");
+                goto out;
+        }
+        result = PyObject_Call(func, py_args, py_kwargs);
+        if (result) {
+            res = PyInt_AsLong(result);
+        }
+out:
+        Py_XDECREF(py_qstate);
+        Py_XDECREF(py_response);
+
+        Py_XDECREF(py_args);
+        Py_XDECREF(py_kwargs);
+        Py_XDECREF(result);
+
+        PyGILState_Release(gstate);
+
+        return res;
+    }
+
+    static int register_inplace_cb_query_response(PyObject* py_cb,
+        struct module_env* env, int id)
+    {
+        int ret = inplace_cb_register(python_inplace_cb_query_response,
+            inplace_cb_query_response, (void*) py_cb, env, id);
+        if (ret) Py_INCREF(py_cb);
+        return ret;
+    }
+
+    int python_inplace_cb_edns_back_parsed_call(struct module_qstate* qstate,
+        int id, void* python_callback)
+    {
+        int res = 0;
+        PyObject *func = python_callback;
+        PyObject *py_qstate = NULL;
+        PyObject *py_args = NULL;
+        PyObject *py_kwargs = NULL;
+        PyObject *result = NULL;
+
+        PyGILState_STATE gstate = PyGILState_Ensure();
+
+        py_qstate = SWIG_NewPointerObj((void*) qstate, SWIGTYPE_p_module_qstate, 0);
+        if(!py_qstate) {
+                log_err("pythonmod: swig pointer failure in python_inplace_cb_edns_back_parsed_call");
+                goto out;
+        }
+        py_args = Py_BuildValue("(O)", py_qstate);
+        py_kwargs = Py_BuildValue("{}");
+        if(!(py_args && py_kwargs)) {
+                log_err("pythonmod: BuildValue failure in python_inplace_cb_edns_back_parsed_call");
+                goto out;
+        }
+        result = PyObject_Call(func, py_args, py_kwargs);
+        if (result) {
+            res = PyInt_AsLong(result);
+        }
+out:
+        Py_XDECREF(py_qstate);
+
+        Py_XDECREF(py_args);
+        Py_XDECREF(py_kwargs);
+        Py_XDECREF(result);
+
+        PyGILState_Release(gstate);
+
+        return res;
+    }
+
+    static int register_inplace_cb_edns_back_parsed_call(PyObject* py_cb,
+        struct module_env* env, int id)
+    {
+        int ret = inplace_cb_register(python_inplace_cb_edns_back_parsed_call,
+            inplace_cb_edns_back_parsed, (void*) py_cb, env, id);
+        if (ret) Py_INCREF(py_cb);
+        return ret;
+    }
 %}
 /* C declarations */
 int inplace_cb_register(void* cb, enum inplace_cb_list_type type, void* cbarg,
@@ -1698,4 +1850,8 @@ static int register_inplace_cb_reply_local(PyObject* py_cb,
 static int register_inplace_cb_reply_servfail(PyObject* py_cb,
     struct module_env* env, int id);
 static int register_inplace_cb_query(PyObject *py_cb,
+    struct module_env* env, int id);
+static int register_inplace_cb_query_response(PyObject *py_cb,
+    struct module_env* env, int id);
+static int register_inplace_cb_edns_back_parsed_call(PyObject *py_cb,
     struct module_env* env, int id);

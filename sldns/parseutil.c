@@ -209,11 +209,13 @@ sldns_hexdigit_to_int(char ch)
 }
 
 uint32_t
-sldns_str2period(const char *nptr, const char **endptr)
+sldns_str2period(const char *nptr, const char **endptr, int* overflow)
 {
 	int sign = 0;
 	uint32_t i = 0;
 	uint32_t seconds = 0;
+	const uint32_t maxint = 0xffffffff;
+	*overflow = 0;
 
 	for(*endptr = nptr; **endptr; (*endptr)++) {
 		switch (**endptr) {
@@ -236,26 +238,46 @@ sldns_str2period(const char *nptr, const char **endptr)
 				break;
 			case 's':
 			case 'S':
+				if(seconds > maxint-i) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i;
 				i = 0;
 				break;
 			case 'm':
 			case 'M':
+				if(i > maxint/60 || seconds > maxint-(i*60)) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i * 60;
 				i = 0;
 				break;
 			case 'h':
 			case 'H':
+				if(i > maxint/(60*60) || seconds > maxint-(i*60*60)) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i * 60 * 60;
 				i = 0;
 				break;
 			case 'd':
 			case 'D':
+				if(i > maxint/(60*60*24) || seconds > maxint-(i*60*60*24)) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i * 60 * 60 * 24;
 				i = 0;
 				break;
 			case 'w':
 			case 'W':
+				if(i > maxint/(60*60*24*7) || seconds > maxint-(i*60*60*24*7)) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i * 60 * 60 * 24 * 7;
 				i = 0;
 				break;
@@ -269,14 +291,26 @@ sldns_str2period(const char *nptr, const char **endptr)
 			case '7':
 			case '8':
 			case '9':
+				if(i > maxint/10 || i*10 > maxint - (**endptr - '0')) {
+					*overflow = 1;
+					return 0;
+				}
 				i *= 10;
 				i += (**endptr - '0');
 				break;
 			default:
+				if(seconds > maxint-i) {
+					*overflow = 1;
+					return 0;
+				}
 				seconds += i;
 				/* disregard signedness */
 				return seconds;
 		}
+	}
+	if(seconds > maxint-i) {
+		*overflow = 1;
+		return 0;
 	}
 	seconds += i;
 	/* disregard signedness */
@@ -402,11 +436,13 @@ sldns_b32_ntop_base(const uint8_t* src, size_t src_sz, char* dst, size_t dst_sz,
 
 		/* ........ ........ ....4444 4....... ........ */
 			 c =  src[3]         >> 7 ;
+		ATTR_FALLTHROUGH
 		/* fallthrough */
 	case 3: dst[4] = b32[(src[2] & 0x0f) << 1 | c];
 
 		/* ........ .......3 3333.... ........ ........ */
 			 c =  src[2]         >> 4 ;
+		ATTR_FALLTHROUGH
 		/* fallthrough */
 	case 2:	dst[3] = b32[(src[1] & 0x01) << 4 | c];
 
@@ -415,6 +451,7 @@ sldns_b32_ntop_base(const uint8_t* src, size_t src_sz, char* dst, size_t dst_sz,
 
 		/* .....111 11...... ........ ........ ........ */
 			 c =  src[1]         >> 6 ;
+		ATTR_FALLTHROUGH
 		/* fallthrough */
 	case 1:	dst[1] = b32[(src[0] & 0x07) << 2 | c];
 
@@ -426,11 +463,14 @@ sldns_b32_ntop_base(const uint8_t* src, size_t src_sz, char* dst, size_t dst_sz,
 		switch (src_sz) {
 			case 1: dst[2] = '=';
 				dst[3] = '=';
+				ATTR_FALLTHROUGH
 				/* fallthrough */
 			case 2: dst[4] = '=';
+				ATTR_FALLTHROUGH
 				/* fallthrough */
 			case 3: dst[5] = '=';
 				dst[6] = '=';
+				ATTR_FALLTHROUGH
 				/* fallthrough */
 			case 4: dst[7] = '=';
 		}
@@ -543,17 +583,20 @@ sldns_b32_pton_base(const char* src, size_t src_sz, uint8_t* dst, size_t dst_sz,
 			/* ........ ........ ........ .55555.. ........ */
 			/* ........ ........ ....4444 4....... ........ */
 			dst[3] = buf[4] << 7 | buf[5] << 2 | buf[6] >> 3;
+			ATTR_FALLTHROUGH
 			/* fallthrough */
 
 		case 5: /* ........ ........ ....4444 4....... ........ */
 			/* ........ .......3 3333.... ........ ........ */
 			dst[2] = buf[3] << 4 | buf[4] >> 1;
+			ATTR_FALLTHROUGH
 			/* fallthrough */
 
 		case 4: /* ........ .......3 3333.... ........ ........ */
 			/* ........ ..22222. ........ ........ ........ */
 			/* .....111 11...... ........ ........ ........ */
 			dst[1] = buf[1] << 6 | buf[2] << 1 | buf[3] >> 4;
+			ATTR_FALLTHROUGH
 			/* fallthrough */
 
 		case 2: /* .....111 11...... ........ ........ ........ */

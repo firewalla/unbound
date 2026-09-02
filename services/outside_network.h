@@ -43,9 +43,15 @@
 #ifndef OUTSIDE_NETWORK_H
 #define OUTSIDE_NETWORK_H
 
+#include "util/alloc.h"
 #include "util/rbtree.h"
+#include "util/regional.h"
 #include "util/netevent.h"
 #include "dnstap/dnstap_config.h"
+#ifdef __QNX__
+/* For struct timeval */
+#include <sys/time.h>
+#endif /* __QNX__ */
 #include "hiredis/hiredis.h"
 struct pending;
 struct pending_timeout;
@@ -65,6 +71,8 @@ struct module_env;
 struct module_qstate;
 struct query_info;
 struct config_file;
+struct shared_ports;
+struct shared_ports_if;
 
 /**
  * Send queries to outside servers and wait for answers from servers.
@@ -112,6 +120,11 @@ struct outside_network {
 	/** if we perform udp-connect, connect() for UDP socket to mitigate
 	 * ICMP side channel leakage */
 	int udp_connect;
+	/** number of udp packets sent. */
+	size_t num_udp_outgoing;
+	/** the shared ports structure, with random ports numbers.
+	 * This is a reference to the member in the daemon structure. */
+	struct shared_ports* shared_ports;
 
 	/** array of outgoing IP4 interfaces */
 	struct port_if* ip4_ifs;
@@ -208,11 +221,8 @@ struct port_if {
 	int pfxlen;
 
 #ifndef DISABLE_EXPLICIT_PORT_RANDOMISATION
-	/** the available ports array. These are unused.
-	 * Only the first total-inuse part is filled. */
-	int* avail_ports;
-	/** the total number of available ports (size of the array) */
-	int avail_total;
+	/** the shared port numbers for this interface. */
+	struct shared_ports_if* shpif;
 #endif
 
 	/** array of the commpoints currently in use. 
@@ -243,6 +253,42 @@ struct port_comm {
 };
 
 /**
+ * Shared ports, the list of ports shared across threads
+ */
+struct shared_ports {
+	/** mutex on the ports */
+	lock_basic_type lock;
+	/** array of IP4 interfaces */
+	struct shared_ports_if* ip4_ifs;
+	/** number of outgoing IP4 interfaces */
+	int num_ip4;
+	/** array of IP6 interfaces */
+	struct shared_ports_if* ip6_ifs;
+	/** number of outgoing IP6 interfaces */
+	int num_ip6;
+};
+
+/**
+ * Shared ports for an interface.
+ */
+struct shared_ports_if {
+	/** address ready to allocate new socket (except port no). */
+	struct sockaddr_storage addr;
+	/** length of addr field */
+	socklen_t addrlen;
+	/** if a netblock, the prefix */
+	int pfxlen;
+
+	/** the available ports array. These are unused.
+	 * Only the first total-inuse part is filled. */
+	int* avail_ports;
+	/** the total number of available ports (size of the array) */
+	int avail_total;
+	/** the number in use. */
+	int inuse;
+};
+
+/**
  * Reuse TCP connection, still open can be used again.
  */
 struct reuse_tcp {
@@ -261,6 +307,9 @@ struct reuse_tcp {
 	socklen_t addrlen;
 	/** also key for tcp_reuse tree, if ssl is used */
 	int is_ssl;
+	/** If is_ssl is enabled, tls_auth_name is part of the key for
+	 * tcp_reuse tree. If the string is NULL, it without a tls_auth_name */
+	char* tls_auth_name;
 	/** lru chain, so that the oldest can be removed to get a new
 	 * connection when all are in (re)use. oldest is last in list.
 	 * The lru only contains empty connections waiting for reuse,
@@ -413,10 +462,12 @@ struct waiting_tcp {
 	void* cb_arg;
 	/** if it uses ssl upstream */
 	int ssl_upstream;
-	/** ref to the tls_auth_name from the serviced_query */
+	/** owned copy of the tls_auth_name (malloced) */
 	char* tls_auth_name;
 	/** the packet was involved in an error, to stop looping errors */
 	int error_count;
+	/** if true, the item is at the cb_and_decommission stage */
+	int in_cb_and_decommission;
 #ifdef USE_DNSTAP
 	/** serviced query pointer for dnstap to get logging info, if nonNULL*/
 	struct serviced_query* sq;
@@ -517,6 +568,15 @@ struct serviced_query {
 	void* pending;
 	/** block size with which to pad encrypted queries (default: 128) */
 	size_t padding_block_size;
+	/** region for this serviced query. Will be cleared when this
+	 * serviced_query will be deleted */
+	struct regional* region;
+	/** allocation service for the region */
+	struct alloc_cache* alloc;
+	/** flash timer to start the net I/O as a separate event */
+	struct comm_timer* timer;
+	/** true if serviced_query is currently doing net I/O and may block */
+	int busy;
 };
 
 /**
@@ -534,8 +594,6 @@ struct serviced_query {
  * @param infra: pointer to infra cached used for serviced queries.
  * @param rnd: stored to create random numbers for serviced queries.
  * @param use_caps_for_id: enable to use 0x20 bits to encode id randomness.
- * @param availports: array of available ports. 
- * @param numavailports: number of available ports in array.
  * @param unwanted_threshold: when to take defensive action.
  * @param unwanted_action: the action to take.
  * @param unwanted_param: user parameter to action.
@@ -550,17 +608,18 @@ struct serviced_query {
  * @param max_reuse_tcp_queries: max number of queries on a reuse connection.
  * @param tcp_reuse_timeout: timeout for REUSE entries in milliseconds.
  * @param tcp_auth_query_timeout: timeout in milliseconds for TCP queries to auth servers.
+ * @param shared_ports: the shared_ports structure.
  * @return: the new structure (with no pending answers) or NULL on error.
  */
 struct outside_network* outside_network_create(struct comm_base* base,
 	size_t bufsize, size_t num_ports, char** ifs, int num_ifs,
 	int do_ip4, int do_ip6, size_t num_tcp, int dscp, struct infra_cache* infra, 
-	struct ub_randstate* rnd, int use_caps_for_id, int* availports, 
-	int numavailports, size_t unwanted_threshold, int tcp_mss,
+	struct ub_randstate* rnd, int use_caps_for_id,
+	size_t unwanted_threshold, int tcp_mss,
 	void (*unwanted_action)(void*), void* unwanted_param, int do_udp,
 	void* sslctx, int delayclose, int tls_use_sni, struct dt_env *dtenv,
 	int udp_connect, int max_reuse_tcp_queries, int tcp_reuse_timeout,
-	int tcp_auth_query_timeout);
+	int tcp_auth_query_timeout, struct shared_ports* shared_ports);
 
 /**
  * Delete outside_network structure.
@@ -624,6 +683,7 @@ void pending_delete(struct outside_network* outnet, struct pending* p);
  * @param want_dnssec: signatures are needed, without EDNS the answer is
  * 	likely to be useless.
  * @param nocaps: ignore use_caps_for_id and use unperturbed qname.
+ * @param check_ratelimit: if set, will check ratelimit before sending out.
  * @param tcp_upstream: use TCP for upstream queries.
  * @param ssl_upstream: use SSL for upstream queries.
  * @param tls_auth_name: when ssl_upstream is true, use this name to check
@@ -640,16 +700,18 @@ void pending_delete(struct outside_network* outnet, struct pending* p);
  * @param callback_arg: user argument to callback function.
  * @param buff: scratch buffer to create query contents in. Empty on exit.
  * @param env: the module environment.
+ * @param was_ratelimited: it will signal back if the query failed to pass the
+ *	ratelimit check.
  * @return 0 on error, or pointer to serviced query that is used to answer
  *	this serviced query may be shared with other callbacks as well.
  */
 struct serviced_query* outnet_serviced_query(struct outside_network* outnet,
 	struct query_info* qinfo, uint16_t flags, int dnssec, int want_dnssec,
-	int nocaps, int tcp_upstream, int ssl_upstream, char* tls_auth_name,
-	struct sockaddr_storage* addr, socklen_t addrlen, uint8_t* zone,
-	size_t zonelen, struct module_qstate* qstate,
+	int nocaps, int check_ratelimit, int tcp_upstream, int ssl_upstream,
+	char* tls_auth_name, struct sockaddr_storage* addr, socklen_t addrlen,
+	uint8_t* zone, size_t zonelen, struct module_qstate* qstate,
 	comm_point_callback_type* callback, void* callback_arg,
-	struct sldns_buffer* buff, struct module_env* env);
+	struct sldns_buffer* buff, struct module_env* env, int* was_ratelimited);
 
 /**
  * Remove service query callback.
@@ -705,10 +767,36 @@ struct reuse_tcp* reuse_tcp_lru_snip(struct outside_network* outnet);
 /** delete readwait waiting_tcp elements, deletes the elements in the list */
 void reuse_del_readwait(rbtree_type* tree_by_id);
 
+/** remove waiting tcp from the outnet waiting list */
+void outnet_waiting_tcp_list_remove(struct outside_network* outnet,
+	struct waiting_tcp* w);
+
+/** pop the first waiting tcp from the outnet waiting list */
+struct waiting_tcp* outnet_waiting_tcp_list_pop(struct outside_network* outnet);
+
+/** add waiting_tcp element to the outnet tcp waiting list */
+void outnet_waiting_tcp_list_add(struct outside_network* outnet,
+	struct waiting_tcp* w, int set_timer);
+
+/** add waiting_tcp element as first to the outnet tcp waiting list */
+void outnet_waiting_tcp_list_add_first(struct outside_network* outnet,
+	struct waiting_tcp* w, int reset_timer);
+
+/** pop the first element from the writewait list */
+struct waiting_tcp* reuse_write_wait_pop(struct reuse_tcp* reuse);
+
+/** remove the element from the writewait list */
+void reuse_write_wait_remove(struct reuse_tcp* reuse, struct waiting_tcp* w);
+
+/** push the element after the last on the writewait list */
+void reuse_write_wait_push_back(struct reuse_tcp* reuse, struct waiting_tcp* w);
+
 /** get TCP file descriptor for address, returns -1 on failure,
- * tcp_mss is 0 or maxseg size to set for TCP packets. */
+ * tcp_mss is 0 or maxseg size to set for TCP packets,
+ * nodelay (TCP_NODELAY) should be set for TLS connections to speed up the TLS
+ * handshake.*/
 int outnet_get_tcp_fd(struct sockaddr_storage* addr, socklen_t addrlen,
-	int tcp_mss, int dscp);
+	int tcp_mss, int dscp, int nodelay);
 
 /**
  * Create udp commpoint suitable for sending packets to the destination.
@@ -773,6 +861,54 @@ struct comm_point* outnet_comm_point_for_http(struct outside_network* outnet,
 /** connect tcp connection to addr, 0 on failure */
 int outnet_tcp_connect(int s, struct sockaddr_storage* addr, socklen_t addrlen);
 
+/**
+ * Create new shared ports structure.
+ * @param ifs: interface names (or NULL for default interface).
+ *    These interfaces must be able to access all authoritative servers.
+ * @param num_ifs: number of names in array ifs.
+ * @param do_ip4: service IP4.
+ * @param do_ip6: service IP6.
+ * @param availports: array of available ports.
+ * @param numavailports: number of available ports in array.
+ * @return new, or NULL on failure.
+ */
+struct shared_ports* shared_ports_create(char** ifs, int num_ifs, int do_ip4,
+	int do_ip6, int* availports, int numavailports);
+
+/**
+ * Delete shared ports structure.
+ * @param shp: shared ports structure.
+ */
+void shared_ports_delete(struct shared_ports* shp);
+
+/** Find interface in shared ports. */
+struct shared_ports_if* shared_ports_find_if(struct shared_ports* shp,
+	struct sockaddr_storage* addr, socklen_t addrlen, int pfxlen);
+
+/**
+ * Get a shared port from the list of random ports.
+ * @param shp: shared ports structure.
+ * @param shpif: the shared ports interface.
+ * @param rnd: used to make random numbers.
+ * @param udp_connect: set to true if no reuse is possible.
+ * @param reusenum: number of ports that can be reused (already open).
+ * @param port: the port number is returned.
+ * @param reused: if the port numer is reused, returned.
+ * @return false on failure. That can mean no more free ports to use.
+ */
+int shared_ports_fetch_random(struct shared_ports* shp,
+	struct shared_ports_if* shpif, struct ub_randstate* rnd,
+	int udp_connect, int reusenum, int* port, int* reused);
+
+/**
+ * Return a shared port to the list of random ports.
+ * @param shp: shared ports structure.
+ * @param shpif: the shared ports interface.
+ * @param port: port number to return to be used again.
+ */
+void shared_ports_return_port(struct shared_ports* shp,
+	struct shared_ports_if* shpif, int port);
+
 /** callback for incoming udp answers from the network */
 int outnet_udp_cb(struct comm_point* c, void* arg, int error,
 	struct comm_reply *reply_info);
@@ -789,6 +925,9 @@ void pending_udp_timer_delay_cb(void *arg);
 
 /** callback for outgoing TCP timer event */
 void outnet_tcptimer(void* arg);
+
+/** callback to send serviced queries */
+void serviced_timer_cb(void *arg);
 
 /** callback for serviced query UDP answers */
 int serviced_udp_callback(struct comm_point* c, void* arg, int error,

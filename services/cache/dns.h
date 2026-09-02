@@ -53,7 +53,7 @@ struct delegpt;
  *  Must be an unsigned 32-bit value larger than 0xffff */
 
 /** Allow caching a DNS message with a zero TTL. */
-#define DNSCACHE_STORE_ZEROTTL 0x100000
+#define DNSCACHE_STORE_EXPIRED_MSG_CACHEDB 0x100000
 
 /**
  * Region allocated message reply
@@ -88,11 +88,16 @@ struct dns_msg {
  * @param flags: flags with BIT_CD for AAAA queries in dns64 translation.
  *   The higher 16 bits are used internally to customize the cache policy.
  *   (See DNSCACHE_STORE_xxx flags).
+ * @param qstarttime: time when the query was started, and thus when the
+ * 	delegations were looked up.
+ * @param is_valrec: if the query is validation recursion and does not get
+ *	dnssec validation itself.
  * @return 0 on alloc error (out of memory).
  */
 int dns_cache_store(struct module_env* env, struct query_info* qinf,
         struct reply_info* rep, int is_referral, time_t leeway, int pside,
-	struct regional* region, uint32_t flags);
+	struct regional* region, uint32_t flags, time_t qstarttime,
+	int is_valrec);
 
 /**
  * Store message in the cache. Stores in message cache and rrset cache.
@@ -112,11 +117,14 @@ int dns_cache_store(struct module_env* env, struct query_info* qinf,
  * 	can be updated to full TTL even in prefetch situations.
  * @param qrep: message that can be altered with better rrs from cache.
  * @param flags: customization flags for the cache policy.
+ * @param qstarttime: time when the query was started, and thus when the
+ * 	delegations were looked up.
  * @param region: to allocate into for qmsg.
  */
 void dns_cache_store_msg(struct module_env* env, struct query_info* qinfo,
 	hashvalue_type hash, struct reply_info* rep, time_t leeway, int pside,
-	struct reply_info* qrep, uint32_t flags, struct regional* region);
+	struct reply_info* qrep, uint32_t flags, struct regional* region,
+	time_t qstarttime);
 
 /**
  * Find a delegation from the cache.
@@ -129,11 +137,18 @@ void dns_cache_store_msg(struct module_env* env, struct query_info* qinfo,
  * @param msg: if not NULL, delegation message is returned here, synthesized
  *	from the cache.
  * @param timenow: the time now, for checking if TTL on cache entries is OK.
+ * @param noexpiredabove: if set, no expired NS rrsets above the one found
+ * 	are tolerated. It only returns delegations where the delegations above
+ * 	it are valid.
+ * @param expiretop: if not NULL, name where check for expiry ends for
+ * 	noexpiredabove.
+ * @param expiretoplen: length of expiretop dname.
  * @return new delegation or NULL on error or if not found in cache.
  */
 struct delegpt* dns_cache_find_delegation(struct module_env* env, 
 	uint8_t* qname, size_t qnamelen, uint16_t qtype, uint16_t qclass, 
-	struct regional* region, struct dns_msg** msg, time_t timenow);
+	struct regional* region, struct dns_msg** msg, time_t timenow,
+	int noexpiredabove, uint8_t* expiretop, size_t expiretoplen);
 
 /**
  * generate dns_msg from cached message
@@ -151,6 +166,15 @@ struct delegpt* dns_cache_find_delegation(struct module_env* env,
 struct dns_msg* tomsg(struct module_env* env, struct query_info* q,
 	struct reply_info* r, struct regional* region, time_t now,
 	int allow_expired, struct regional* scratch);
+
+/**
+ * Deep copy a dns_msg to a region.
+ * @param origin: the dns_msg to copy.
+ * @param region: the region to copy all the data to.
+ * @return the new dns_msg or NULL on malloc error.
+ */
+struct dns_msg* dns_msg_deepcopy_region(struct dns_msg* origin,
+	struct regional* region);
 
 /** 
  * Find cached message 
@@ -181,10 +205,11 @@ struct dns_msg* dns_cache_lookup(struct module_env* env,
  * @param qclass: which class to look in.
  * @param region: where to store new dp info.
  * @param dp: delegation point to fill missing entries.
+ * @param flags: rrset flags, or 0.
  * @return false on alloc failure.
  */
 int cache_fill_missing(struct module_env* env, uint16_t qclass, 
-	struct regional* region, struct delegpt* dp);
+	struct regional* region, struct delegpt* dp, uint32_t flags);
 
 /**
  * Utility, create new, unpacked data structure for cache response.

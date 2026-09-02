@@ -3,6 +3,7 @@ server:
 	target-fetch-policy: "0 0 0 0 0"
 	qname-minimisation: "no"
 	minimal-responses: no
+	iter-scrub-promiscuous: no
 
 	private-address: 10.0.0.0/8
 	private-address: 172.16.0.0/12
@@ -122,6 +123,8 @@ REPLY QR NOERROR
 SECTION QUESTION
 ns.example.com. IN AAAA
 SECTION ANSWER
+SECTION AUTHORITY
+example.com. IN SOA ns.example.com. root.example.com. 4 14400 3600 604800 3600
 ENTRY_END
 
 ENTRY_BEGIN

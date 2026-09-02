@@ -137,7 +137,7 @@ test_buffers(sldns_buffer* pkt, sldns_buffer* out)
 	/* compare packets */
 	unit_assert(match_all(sldns_buffer_begin(pkt), sldns_buffer_limit(pkt),
 		sldns_buffer_begin(out), sldns_buffer_limit(out), 1,
-		matches_nolocation));
+		matches_nolocation, 0));
 	return 0;
 }
 
@@ -498,7 +498,11 @@ testfromdrillfile(sldns_buffer* pkt, struct alloc_cache* alloc,
 #define xstr(s) str(s)
 #define str(s) #s
 
+#ifndef __QNX__
 #define SRCDIRSTR xstr(SRCDIR)
+#else /* !__QNX__ */
+#define SRCDIRSTR "."
+#endif /* __QNX__ */
 
 void msgparse_test(void)
 {

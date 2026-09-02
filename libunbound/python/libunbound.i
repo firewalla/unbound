@@ -36,6 +36,9 @@
 %begin %{
 /* store state of warning output, restored at later pop */
 #pragma GCC diagnostic push
+/* ignore warnings for pragma below, where for older GCC it can produce a
+   warning if the cast-function-type warning is absent. */
+#pragma GCC diagnostic ignored "-Wpragmas"
 /* ignore gcc8 METH_NOARGS function cast warnings for swig function pointers */
 #pragma GCC diagnostic ignored "-Wcast-function-type"
 %}
@@ -850,7 +853,7 @@ Result: ['74.125.43.147', '74.125.43.99', '74.125.43.103', '74.125.43.104']
 %{ 
   //printf("resolve_start(%lX)\n",(long unsigned int)arg1);
   Py_BEGIN_ALLOW_THREADS 
-  $function 
+  $action
   Py_END_ALLOW_THREADS 
   //printf("resolve_stop()\n");
 %} 
@@ -860,6 +863,9 @@ Result: ['74.125.43.147', '74.125.43.99', '74.125.43.103', '74.125.43.104']
 %inline %{
   //SWIG will see the ub_ctx as a class
   struct ub_ctx {
+          /* Dummy member, so the struct is not empty, MSVC complains about
+           * that. */
+          int dummy;
   };
 %}
 

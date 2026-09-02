@@ -21,7 +21,6 @@
  */
 
 #include "config.h"
-struct sockaddr_storage;
 #include <errno.h>
 #include <stdarg.h>
 #include <ctype.h>
@@ -128,16 +127,24 @@ static void matchline(char* line, struct entry* e)
 			e->match_answer = 1;
 		} else if(str_keyword(&parse, "subdomain")) {
 			e->match_subdomain = 1;
+		} else if(str_keyword(&parse, "all_noedns")) {
+			e->match_all_noedns = 1;
 		} else if(str_keyword(&parse, "all")) {
 			e->match_all = 1;
 		} else if(str_keyword(&parse, "ttl")) {
 			e->match_ttl = 1;
 		} else if(str_keyword(&parse, "DO")) {
 			e->match_do = 1;
+		} else if(str_keyword(&parse, "CO")) {
+			e->match_co = 1;
 		} else if(str_keyword(&parse, "noedns")) {
 			e->match_noedns = 1;
 		} else if(str_keyword(&parse, "ednsdata")) {
 			e->match_ednsdata_raw = 1;
+		} else if(str_keyword(&parse, "client_cookie")) {
+			e->match_client_cookie = 1;
+		} else if(str_keyword(&parse, "server_cookie")) {
+			e->match_server_cookie = 1;
 		} else if(str_keyword(&parse, "UDP")) {
 			e->match_transport = transport_udp;
 		} else if(str_keyword(&parse, "TCP")) {
@@ -148,7 +155,22 @@ static void matchline(char* line, struct entry* e)
 				error("expected = or : in MATCH: %s", line);
 			parse++;
 			e->ixfr_soa_serial = (uint32_t)strtol(parse, (char**)&parse, 10);
-			while(isspace((unsigned char)*parse)) 
+			while(isspace((unsigned char)*parse))
+				parse++;
+		} else if(str_keyword(&parse, "ede")) {
+			e->match_ede = 1;
+			if(*parse != '=' && *parse != ':')
+				error("expected = or : in MATCH: %s", line);
+			parse++;
+			while(isspace((unsigned char)*parse))
+				parse++;
+			if(str_keyword(&parse, "any")) {
+				e->match_ede_any = 1;
+			} else {
+				e->ede_info_code = (uint16_t)strtol(parse,
+					(char**)&parse, 10);
+			}
+			while(isspace((unsigned char)*parse))
 				parse++;
 		} else {
 			error("could not parse MATCH: '%s'", parse);
@@ -158,7 +180,7 @@ static void matchline(char* line, struct entry* e)
 
 /** parse REPLY line */
 static void replyline(char* line, uint8_t* reply, size_t reply_len,
-	int* do_flag)
+	int* do_flag, int* co_flag)
 {
 	char* parse = line;
 	if(reply_len < LDNS_HEADER_SIZE) error("packet too short for header");
@@ -216,6 +238,8 @@ static void replyline(char* line, uint8_t* reply, size_t reply_len,
 			LDNS_AD_SET(reply);
 		} else if(str_keyword(&parse, "DO")) {
 			*do_flag = 1;
+		} else if(str_keyword(&parse, "CO")) {
+			*co_flag = 1;
 		} else {
 			error("could not parse REPLY: '%s'", parse);
 		}
@@ -266,11 +290,16 @@ static struct entry* new_entry(void)
 	e->match_answer = 0;
 	e->match_subdomain = 0;
 	e->match_all = 0;
+	e->match_all_noedns = 0;
 	e->match_ttl = 0;
 	e->match_do = 0;
+	e->match_co = 0;
 	e->match_noedns = 0;
 	e->match_serial = 0;
 	e->ixfr_soa_serial = 0;
+	e->match_ede = 0;
+	e->match_ede_any = 0;
+	e->ede_info_code = -1;
 	e->match_transport = transport_any;
 	e->reply_list = NULL;
 	e->copy_id = 0;
@@ -446,6 +475,7 @@ get_origin(const char* name, struct sldns_file_parse_state* pstate, char* parse)
 	store = *end;
 	*end = 0;
 	verbose(3, "parsing '%s'\n", parse);
+	pstate->origin_len = sizeof(pstate->origin);
 	status = sldns_str2wire_dname_buf(parse, pstate->origin,
 		&pstate->origin_len);
 	*end = store;
@@ -496,15 +526,17 @@ static void add_rr(char* rrstr, uint8_t* pktbuf, size_t pktsize,
 
 /* add EDNS 4096 opt record */
 static void
-add_edns(uint8_t* pktbuf, size_t pktsize, int do_flag, uint8_t *ednsdata,
-	uint16_t ednslen, size_t* pktlen)
+add_edns(uint8_t* pktbuf, size_t pktsize, int do_flag, int co_flag,
+	uint8_t *ednsdata, uint16_t ednslen, size_t* pktlen)
 {
 	uint8_t edns[] = {0x00, /* root label */
 		0x00, LDNS_RR_TYPE_OPT, /* type */
 		0x04, 0xD0, /* class is UDPSIZE 1232 */
 		0x00, /* TTL[0] is ext rcode */
 		0x00, /* TTL[1] is edns version */
-		(uint8_t)(do_flag?0x80:0x00), 0x00, /* TTL[2-3] is edns flags, DO */
+		(uint8_t)(do_flag?0x80:0x00)
+		| (uint8_t)(co_flag?0x40:0x00)
+		, 0x00, /* TTL[2-3] is edns flags, DO */
 		(uint8_t)((ednslen >> 8) & 0xff),
 		(uint8_t)(ednslen  & 0xff), /* rdatalength */
 	};
@@ -536,6 +568,7 @@ read_entry(FILE* in, const char* name, struct sldns_file_parse_state* pstate,
 	uint8_t pktbuf[MAX_PACKETLEN];
 	size_t pktlen = LDNS_HEADER_SIZE;
 	int do_flag = 0; /* DO flag in EDNS */
+	int co_flag = 0; /* CO flag in EDNS */
 	memset(pktbuf, 0, pktlen); /* ID = 0, FLAGS="", and rr counts 0 */
 
 	while(fgets(line, (int)sizeof(line), in) != NULL) {
@@ -573,7 +606,7 @@ read_entry(FILE* in, const char* name, struct sldns_file_parse_state* pstate,
 		if(str_keyword(&parse, "MATCH")) {
 			matchline(parse, current);
 		} else if(str_keyword(&parse, "REPLY")) {
-			replyline(parse, pktbuf, pktlen, &do_flag);
+			replyline(parse, pktbuf, pktlen, &do_flag, &co_flag);
 		} else if(str_keyword(&parse, "ADJUST")) {
 			adjustline(parse, current, cur_reply);
 		} else if(str_keyword(&parse, "EXTRA_PACKET")) {
@@ -629,15 +662,16 @@ read_entry(FILE* in, const char* name, struct sldns_file_parse_state* pstate,
 			if(hex_ednsdata_buffer)
 				sldns_buffer_free(hex_ednsdata_buffer);
 			if(pktlen != 0) {
-				if(do_flag || cur_reply->raw_ednsdata) {
+				if(do_flag || co_flag
+					|| cur_reply->raw_ednsdata) {
 					if(cur_reply->raw_ednsdata &&
 						sldns_buffer_limit(cur_reply->raw_ednsdata))
-						add_edns(pktbuf, sizeof(pktbuf), do_flag,
+						add_edns(pktbuf, sizeof(pktbuf), do_flag, co_flag,
 							sldns_buffer_begin(cur_reply->raw_ednsdata),
 							(uint16_t)sldns_buffer_limit(cur_reply->raw_ednsdata),
 							&pktlen);
 					else
-						add_edns(pktbuf, sizeof(pktbuf), do_flag,
+						add_edns(pktbuf, sizeof(pktbuf), do_flag, co_flag,
 							NULL, 0, &pktlen);
 				}
 				cur_reply->reply_pkt = memdup(pktbuf, pktlen);
@@ -817,7 +851,7 @@ static uint32_t get_serial(uint8_t* p, size_t plen)
 	return 0;
 }
 
-/** get ptr to EDNS OPT record (and remaining length); behind the type u16 */
+/** get ptr to EDNS OPT record (and remaining length); after the type u16 */
 static int
 pkt_find_edns_opt(uint8_t** p, size_t* plen)
 {
@@ -882,6 +916,86 @@ get_do_flag(uint8_t* pkt, size_t len)
 		return 0; /* malformed */
 	edns_bits = sldns_read_uint16(walk+4);
 	return (int)(edns_bits&LDNS_EDNS_MASK_DO_BIT);
+}
+
+/** return true if the CO flag is set */
+static int
+get_co_flag(uint8_t* pkt, size_t len)
+{
+	uint16_t edns_bits;
+	uint8_t* walk = pkt;
+	size_t walk_len = len;
+	if(!pkt_find_edns_opt(&walk, &walk_len)) {
+		return 0;
+	}
+	if(walk_len < 6)
+		return 0; /* malformed */
+	edns_bits = sldns_read_uint16(walk+4);
+	return (int)(edns_bits&LDNS_EDNS_MASK_CO_BIT);
+}
+
+/** Snips the specified EDNS option out of the OPT record and puts it in the
+ *  provided buffer. The buffer should be able to hold any opt data ie 65535.
+ *  Returns the length of the option written,
+ *  or 0 if not found, else -1 on error. */
+static int
+pkt_snip_edns_option(uint8_t* pkt, size_t len, sldns_edns_option code,
+	uint8_t* buf)
+{
+	uint8_t *rdata, *opt_position = pkt;
+	uint16_t rdlen, optlen;
+	size_t remaining = len;
+	if(!pkt_find_edns_opt(&opt_position, &remaining)) return 0;
+	if(remaining < 8) return -1; /* malformed */
+	rdlen = sldns_read_uint16(opt_position+6);
+	if(remaining < ((size_t)rdlen)+8)
+		return -1; /* malformed */
+	rdata = opt_position + 8;
+	while(rdlen > 0) {
+		if(rdlen < 4) return -1; /* malformed */
+		optlen = sldns_read_uint16(rdata+2);
+		if((size_t)rdlen < 4+((size_t)optlen))
+			return -1; /* malformed */
+		if(sldns_read_uint16(rdata) == code) {
+			/* save data to buf for caller inspection */
+			memmove(buf, rdata+4, optlen);
+			/* snip option from packet; assumes len is correct */
+			memmove(rdata, rdata+4+optlen,
+				(pkt+len)-(rdata+4+optlen));
+			/* update OPT size */
+			sldns_write_uint16(opt_position+6,
+				sldns_read_uint16(opt_position+6)-(4+optlen));
+			return optlen;
+		}
+		rdlen -= 4 + optlen;
+		rdata += 4 + optlen;
+	}
+	return 0;
+}
+
+/** Snips the EDE option out of the OPT record and returns the EDNS EDE
+ *  INFO-CODE if found, else -1 */
+static int
+extract_ede(uint8_t* pkt, size_t len)
+{
+	uint8_t buf[65535];
+	int buflen = pkt_snip_edns_option(pkt, len, LDNS_EDNS_EDE, buf);
+	if(buflen < 2 /*ede without text at minimum*/) return -1;
+	return sldns_read_uint16(buf);
+}
+
+/** Snips the DNS Cookie option out of the OPT record and puts it in the
+ *  provided cookie buffer (should be at least 24 octets).
+ *  Returns the length of the cookie if found, else -1. */
+static int
+extract_cookie(uint8_t* pkt, size_t len, uint8_t* cookie)
+{
+	uint8_t buf[65535];
+	int buflen = pkt_snip_edns_option(pkt, len, LDNS_EDNS_COOKIE, buf);
+	if(buflen != 8 /*client cookie*/ &&
+		buflen != 8 + 16 /*server cookie*/) return -1;
+	memcpy(cookie, buf, buflen);
+	return buflen;
 }
 
 /** zero TTLs in packet */
@@ -1049,8 +1163,9 @@ static void lowercase_dname(uint8_t** p, size_t* remain)
 	while(**p != 0) {
 		/* compressed? */
 		if((**p & 0xc0) == 0xc0) {
-			*p += 2;
-			*remain -= 2;
+			llen = *remain < 2 ? (unsigned int)*remain : 2;
+			*p += llen;
+			*remain -= llen;
 			return;
 		}
 		llen = (unsigned int)**p;
@@ -1093,6 +1208,12 @@ static void lowercase_rdata(uint8_t** p, size_t* remain,
 			uint8_t len;
 			if(rdataremain == 0) return;
 			len = **p;
+			if(rdataremain < ((size_t)len)+1) {
+				/* malformed LDNS_RDF_TYPE_STR, skip remainder */
+				*p += rdataremain;
+				*remain -= rdatalen;
+				return;
+			}
 			*p += len+1;
 			rdataremain -= len+1;
 		} else {
@@ -1121,6 +1242,12 @@ static void lowercase_rdata(uint8_t** p, size_t* remain,
 				len = 16;
 				break;
 			default: error("bad rdf type in lowercase %d", (int)f);
+			}
+			if (rdataremain < (size_t)len) {
+				/* malformed RDF, skip remainder */
+				*p += rdataremain;
+				*remain -= rdatalen;
+				return;
 			}
 			*p += len;
 			rdataremain -= len;
@@ -1201,7 +1328,7 @@ match_question(uint8_t* q, size_t qlen, uint8_t* p, size_t plen, int mttl)
 		return 0;
 	}
 	
-	/* remove after answer section, (;; AUTH, ;; ADD, ;; MSG size ..) */
+	/* remove after answer section, (;; ANS, ;; AUTH, ;; ADD  ..) */
 	s = strstr(qcmpstr, ";; ANSWER SECTION");
 	if(!s) s = strstr(qcmpstr, ";; AUTHORITY SECTION");
 	if(!s) s = strstr(qcmpstr, ";; ADDITIONAL SECTION");
@@ -1292,18 +1419,36 @@ match_answer(uint8_t* q, size_t qlen, uint8_t* p, size_t plen, int mttl)
 	return r;
 }
 
+/** ignore EDNS lines in the string by overwriting them with what's left or
+ *  zero out if at end of the string */
+static int
+ignore_edns_lines(char* str) {
+	char* edns = str, *n;
+	size_t str_len = strlen(str);
+	while((edns = strstr(edns, "; EDNS"))) {
+		n = strchr(edns, '\n');
+		if(!n) {
+			/* EDNS at end of string; zero */
+			*edns = 0;
+			break;
+		}
+		memmove(edns, n+1, str_len-(n-str));
+	}
+	return 1;
+}
+
 /** match all of the packet */
 int
 match_all(uint8_t* q, size_t qlen, uint8_t* p, size_t plen, int mttl,
-	int noloc)
+	int noloc, int noedns)
 {
 	char* qstr, *pstr;
 	uint8_t* qb = q, *pb = p;
 	int r;
-	/* zero TTLs */
 	qb = memdup(q, qlen);
 	pb = memdup(p, plen);
 	if(!qb || !pb) error("out of memory");
+	/* zero TTLs */
 	if(!mttl) {
 		zerottls(qb, qlen);
 		zerottls(pb, plen);
@@ -1313,6 +1458,11 @@ match_all(uint8_t* q, size_t qlen, uint8_t* p, size_t plen, int mttl,
 	qstr = sldns_wire2str_pkt(qb, qlen);
 	pstr = sldns_wire2str_pkt(pb, plen);
 	if(!qstr || !pstr) error("cannot pkt2string");
+	/* should we ignore EDNS lines? */
+	if(noedns) {
+		ignore_edns_lines(qstr);
+		ignore_edns_lines(pstr);
+	}
 	r = (strcmp(qstr, pstr) == 0);
 	if(!r) {
 		/* remove ;; MSG SIZE (at end of string) */
@@ -1321,8 +1471,8 @@ match_all(uint8_t* q, size_t qlen, uint8_t* p, size_t plen, int mttl,
 		s = strstr(pstr, ";; MSG SIZE");
 		if(s) *s=0;
 		r = (strcmp(qstr, pstr) == 0);
-		if(!r && !noloc) {
-			/* we are going to fail see if it is because of EDNS */
+		if(!r && !noloc && !noedns) {
+			/* we are going to fail, see if the cause is EDNS */
 			char* a = strstr(qstr, "; EDNS");
 			char* b = strstr(pstr, "; EDNS");
 			if( (a&&!b) || (b&&!a) ) {
@@ -1428,13 +1578,53 @@ find_match(struct entry* entries, uint8_t* query_pkt, size_t len,
 	enum transport_type transport)
 {
 	struct entry* p = entries;
-	uint8_t* reply;
-	size_t rlen;
+	uint8_t* reply, *query_pkt_orig;
+	size_t rlen, query_pkt_orig_len;
+	/* Keep the original packet; it may be modified */
+	query_pkt_orig = memdup(query_pkt, len);
+	query_pkt_orig_len = len;
 	for(p=entries; p; p=p->next) {
 		verbose(3, "comparepkt: ");
 		reply = p->reply_list->reply_pkt;
 		rlen = p->reply_list->reply_len;
-		if(p->match_opcode && get_opcode(query_pkt, len) != 
+		/* Restore the original packet for each entry */
+		memcpy(query_pkt, query_pkt_orig, query_pkt_orig_len);
+		/* EDE should be first since it may modify the query_pkt */
+		if(p->match_ede) {
+			int info_code = extract_ede(query_pkt, len);
+			if(info_code == -1) {
+				verbose(3, "bad EDE. Expected but not found\n");
+				continue;
+			} else if(!p->match_ede_any &&
+				(uint16_t)info_code != p->ede_info_code) {
+				verbose(3, "bad EDE INFO-CODE. Expected: %d, "
+					"and got: %d\n", (int)p->ede_info_code,
+					info_code);
+				continue;
+			}
+		}
+		/* Cookies could also modify the query_pkt; keep them early */
+		if(p->match_client_cookie || p->match_server_cookie) {
+			uint8_t cookie[24];
+			int cookie_len = extract_cookie(query_pkt, len,
+				cookie);
+			if(cookie_len == -1) {
+				verbose(3, "bad DNS Cookie. "
+					"Expected but not found\n");
+				continue;
+			} else if(p->match_client_cookie &&
+				cookie_len != 8) {
+				verbose(3, "bad DNS Cookie. Expected client "
+					"cookie of length 8.");
+				continue;
+			} else if((p->match_server_cookie) &&
+				cookie_len != 24) {
+				verbose(3, "bad DNS Cookie. Expected server "
+					"cookie of length 24.");
+				continue;
+			}
+		}
+		if(p->match_opcode && get_opcode(query_pkt, len) !=
 			get_opcode(reply, rlen)) {
 			verbose(3, "bad opcode\n");
 			continue;
@@ -1489,6 +1679,10 @@ find_match(struct entry* entries, uint8_t* query_pkt, size_t len,
 			verbose(3, "no DO bit set\n");
 			continue;
 		}
+		if(p->match_co && !get_co_flag(query_pkt, len)) {
+			verbose(3, "no CO bit set\n");
+			continue;
+		}
 		if(p->match_noedns && get_has_edns(query_pkt, len)) {
 			verbose(3, "bad; EDNS OPT present\n");
 			continue;
@@ -1502,14 +1696,25 @@ find_match(struct entry* entries, uint8_t* query_pkt, size_t len,
 			verbose(3, "bad transport\n");
 			continue;
 		}
+		if(p->match_all_noedns && !match_all(query_pkt, len, reply,
+			rlen, (int)p->match_ttl, 0, 1)) {
+			verbose(3, "bad all_noedns match\n");
+			continue;
+		}
 		if(p->match_all && !match_all(query_pkt, len, reply, rlen,
-			(int)p->match_ttl, 0)) {
+			(int)p->match_ttl, 0, 0)) {
 			verbose(3, "bad allmatch\n");
 			continue;
 		}
 		verbose(3, "match!\n");
+		/* Restore the original packet */
+		memcpy(query_pkt, query_pkt_orig, query_pkt_orig_len);
+		free(query_pkt_orig);
 		return p;
 	}
+	/* Restore the original packet */
+	memcpy(query_pkt, query_pkt_orig, query_pkt_orig_len);
+	free(query_pkt_orig);
 	return NULL;
 }
 
@@ -1569,11 +1774,14 @@ adjust_packet(struct entry* match, uint8_t** answer_pkt, size_t *answer_len,
 		memmove(res+LDNS_HEADER_SIZE+dlen+4,
 			orig+LDNS_HEADER_SIZE+olen+4,
 			reslen-(LDNS_HEADER_SIZE+dlen+4));
+	} else if(origlen == 0) {
+		res = NULL;
+		reslen = 0;
 	} else {
 		res = memdup(orig, origlen);
 		reslen = origlen;
 	}
-	if(!res) {
+	if(!res && reslen > 0) {
 		verbose(1, "out of memory; send without adjust\n");
 		return;
 	}

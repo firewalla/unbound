@@ -7,6 +7,9 @@ server:
 	qname-minimisation: "no"
 	fake-sha1: yes
 	trust-anchor-signaling: no
+	ede: yes
+	access-control: 127.0.0.0/8 allow_snoop
+
 stub-zone:
 	name: "nsecwc.nlnetlabs.nl"
 	stub-addr: "185.49.140.60"
@@ -15,8 +18,8 @@ CONFIG_END
 
 SCENARIO_BEGIN Test validator with nodata response with wildcard expanded NSEC record, original NSEC owner does not provide proof for QNAME. CVE-2017-15105 test.
 
- ; ns.example.com.                                                                
-RANGE_BEGIN 0 100                                                                
+ ; ns.example.com.
+RANGE_BEGIN 0 100
 	ADDRESS 185.49.140.60
 
 ; response to DNSKEY priming query
@@ -60,13 +63,28 @@ ENTRY_END
 ; recursion happens here.
 STEP 10 CHECK_ANSWER
 ENTRY_BEGIN
-MATCH all
+MATCH all ede=6
 REPLY QR RD RA DO SERVFAIL
 SECTION QUESTION
 _25._tcp.mail.nsecwc.nlnetlabs.nl. IN   TLSA
 SECTION ANSWER
-SECTION AUTHORITY
-SECTION ADDITIONAL
+ENTRY_END
+
+; Redo the query without RD to check EDE caching.
+STEP 11 QUERY
+ENTRY_BEGIN
+REPLY DO
+SECTION QUESTION
+_25._tcp.mail.nsecwc.nlnetlabs.nl. IN   TLSA
+ENTRY_END
+
+STEP 12 CHECK_ANSWER
+ENTRY_BEGIN
+MATCH all ede=6
+REPLY QR RA DO SERVFAIL
+SECTION QUESTION
+_25._tcp.mail.nsecwc.nlnetlabs.nl. IN   TLSA
+SECTION ANSWER
 ENTRY_END
 
 SCENARIO_END

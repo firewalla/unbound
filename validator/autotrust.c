@@ -353,17 +353,21 @@ autr_tp_create(struct val_anchors* anchors, uint8_t* own, size_t own_len,
 
 	lock_basic_lock(&anchors->lock);
 	if(!rbtree_insert(anchors->tree, &tp->node)) {
+		char buf[LDNS_MAX_DOMAINLEN];
 		lock_basic_unlock(&anchors->lock);
-		log_err("trust anchor presented twice");
+		dname_str(tp->name, buf);
+		log_err("trust anchor for '%s' presented twice", buf);
 		free(tp->name);
 		free(tp->autr);
 		free(tp);
 		return NULL;
 	}
 	if(!rbtree_insert(&anchors->autr->probe, &tp->autr->pnode)) {
+		char buf[LDNS_MAX_DOMAINLEN];
 		(void)rbtree_delete(anchors->tree, tp);
 		lock_basic_unlock(&anchors->lock);
-		log_err("trust anchor in probetree twice");
+		dname_str(tp->name, buf);
+		log_err("trust anchor for '%s' in probetree twice", buf);
 		free(tp->name);
 		free(tp->autr);
 		free(tp);
@@ -1203,13 +1207,8 @@ void autr_write_file(struct module_env* env, struct trust_anchor* tp)
 #else
 	llvalue = (unsigned long long)tp;
 #endif
-#ifndef USE_WINSOCK
-	snprintf(tempf, sizeof(tempf), "%s.%d-%d-%llx", fname, (int)getpid(),
+	snprintf(tempf, sizeof(tempf), "%s.%d-%d-" ARG_LL "x", fname, (int)getpid(),
 		env->worker?*(int*)env->worker:0, llvalue);
-#else
-	snprintf(tempf, sizeof(tempf), "%s.%d-%d-%I64x", fname, (int)getpid(),
-		env->worker?*(int*)env->worker:0, llvalue);
-#endif
 #endif /* S_SPLINT_S */
 	verbose(VERB_ALGO, "autotrust: write to disk: %s", tempf);
 	out = fopen(tempf, "w");
@@ -1263,12 +1262,13 @@ verify_dnskey(struct module_env* env, struct val_env* ve,
         struct trust_anchor* tp, struct ub_packed_rrset_key* rrset,
 	struct module_qstate* qstate)
 {
+	char reasonbuf[256];
 	char* reason = NULL;
 	uint8_t sigalg[ALGO_NEEDS_MAX+1];
 	int downprot = env->cfg->harden_algo_downgrade;
 	enum sec_status sec = val_verify_DNSKEY_with_TA(env, ve, rrset,
 		tp->ds_rrset, tp->dnskey_rrset, downprot?sigalg:NULL, &reason,
-		qstate);
+		NULL, qstate, reasonbuf, sizeof(reasonbuf));
 	/* sigalg is ignored, it returns algorithms signalled to exist, but
 	 * in 5011 there are no other rrsets to check.  if downprot is
 	 * enabled, then it checks that the DNSKEY is signed with all
@@ -1317,7 +1317,7 @@ rr_is_selfsigned_revoked(struct module_env* env, struct val_env* ve,
 	/* no algorithm downgrade protection necessary, if it is selfsigned
 	 * revoked it can be removed. */
 	sec = dnskey_verify_rrset(env, ve, dnskey_rrset, dnskey_rrset, i, 
-		&reason, LDNS_SECTION_ANSWER, qstate);
+		&reason, NULL, LDNS_SECTION_ANSWER, qstate);
 	return (sec == sec_status_secure);
 }
 
@@ -2035,23 +2035,38 @@ wait_probe_time(struct val_anchors* anchors)
 	return 0;
 }
 
-/** reset worker timer */
+/** reset worker timer, at the time from wait_probe_time. */
 static void
-reset_worker_timer(struct module_env* env)
+reset_worker_timer_at(struct module_env* env, time_t next)
 {
 	struct timeval tv;
 #ifndef S_SPLINT_S
-	time_t next = (time_t)wait_probe_time(env->anchors);
 	/* in case this is libunbound, no timer */
 	if(!env->probe_timer)
 		return;
 	if(next > *env->now)
 		tv.tv_sec = (time_t)(next - *env->now);
 	else	tv.tv_sec = 0;
+#else
+	(void)next;
 #endif
 	tv.tv_usec = 0;
 	comm_timer_set(env->probe_timer, &tv);
 	verbose(VERB_ALGO, "scheduled next probe in " ARG_LL "d sec", (long long)tv.tv_sec);
+}
+
+/** reset worker timer. This routine manages the locks on acquiring the
+ * next time for the timer. */
+static void
+reset_worker_timer(struct module_env* env)
+{
+	time_t next;
+	if(!env->anchors)
+		return;
+	lock_basic_lock(&env->anchors->lock);
+	next = wait_probe_time(env->anchors);
+	lock_basic_unlock(&env->anchors->lock);
+	reset_worker_timer_at(env, next);
 }
 
 /** set next probe for trust anchor */
@@ -2092,7 +2107,7 @@ set_next_probe(struct module_env* env, struct trust_anchor* tp,
 	verbose(VERB_ALGO, "next probe set in %d seconds", 
 		(int)tp->autr->next_probe_time - (int)*env->now);
 	if(mold != mnew) {
-		reset_worker_timer(env);
+		reset_worker_timer_at(env, mnew);
 	}
 	return 1;
 }
@@ -2147,7 +2162,7 @@ autr_tp_remove(struct module_env* env, struct trust_anchor* tp,
 		autr_point_delete(del_tp);
 	}
 	if(mold != mnew) {
-		reset_worker_timer(env);
+		reset_worker_timer_at(env, mnew);
 	}
 }
 
@@ -2288,7 +2303,9 @@ static void
 autr_debug_print_tp(struct trust_anchor* tp)
 {
 	struct autr_ta* ta;
-	char buf[257];
+	/* Note: buf is also used for autr_ctime_r but that only needs a size
+	 *       of 26, so LDNS_MAX_DOMAINLEN is enough. */
+	char buf[LDNS_MAX_DOMAINLEN];
 	if(!tp->autr)
 		return;
 	dname_str(tp->name, buf);
@@ -2381,6 +2398,8 @@ probe_anchor(struct module_env* env, struct trust_anchor* tp)
 	edns.opt_list_out = NULL;
 	edns.opt_list_inplace_cb_out = NULL;
 	edns.padding_block_size = 0;
+	edns.cookie_present = 0;
+	edns.cookie_valid = 0;
 	if(sldns_buffer_capacity(buf) < 65535)
 		edns.udp_size = (uint16_t)sldns_buffer_capacity(buf);
 	else	edns.udp_size = 65535;
@@ -2397,7 +2416,7 @@ probe_anchor(struct module_env* env, struct trust_anchor* tp)
 		qinfo.qclass);
 
 	if(!mesh_new_callback(env->mesh, &qinfo, qflags, &edns, buf, 0, 
-		&probe_answer_cb, env)) {
+		&probe_answer_cb, env, 0)) {
 		log_err("out of memory making 5011 probe");
 	}
 }

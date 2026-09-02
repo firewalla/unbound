@@ -45,6 +45,7 @@
 #define VALIDATOR_VAL_SIGCRYPT_H
 #include "util/data/packed_rrset.h"
 #include "sldns/pkthdr.h"
+#include "sldns/rrdef.h"
 struct val_env;
 struct module_env;
 struct module_qstate;
@@ -133,12 +134,14 @@ int algo_needs_missing(struct algo_needs* n);
 
 /**
  * Format error reason for algorithm missing.
- * @param env: module env with scratch for temp storage of string.
  * @param alg: DNSKEY-algorithm missing.
  * @param reason: destination.
  * @param s: string, appended with 'with algorithm ..'.
+ * @param reasonbuf: buffer to use for fail reason string print.
+ * @param reasonlen: length of reasonbuf.
  */
-void algo_needs_reason(struct module_env* env, int alg, char** reason, char* s);
+void algo_needs_reason(int alg, char** reason, char* s, char* reasonbuf,
+	size_t reasonlen);
 
 /** 
  * Check if dnskey matches a DS digest 
@@ -256,16 +259,22 @@ uint16_t dnskey_get_flags(struct ub_packed_rrset_key* k, size_t idx);
  * @param sigalg: if nonNULL provide downgrade protection otherwise one
  *   algorithm is enough.
  * @param reason: if bogus, a string returned, fixed or alloced in scratch.
+ * @param reason_bogus: EDE (RFC8914) code paired with the reason of failure.
  * @param section: section of packet where this rrset comes from.
  * @param qstate: qstate with region.
+ * @param verified: if not NULL the number of RRSIG validations is returned.
+ * @param reasonbuf: buffer to use for fail reason string print.
+ * @param reasonlen: length of reasonbuf.
  * @return SECURE if one key in the set verifies one rrsig.
  *	UNCHECKED on allocation errors, unsupported algorithms, malformed data,
  *	and BOGUS on verification failures (no keys match any signatures).
  */
 enum sec_status dnskeyset_verify_rrset(struct module_env* env, 
 	struct val_env* ve, struct ub_packed_rrset_key* rrset, 
-	struct ub_packed_rrset_key* dnskey, uint8_t* sigalg, char** reason,
-	sldns_pkt_section section, struct module_qstate* qstate);
+	struct ub_packed_rrset_key* dnskey, uint8_t* sigalg,
+	char** reason, sldns_ede_code *reason_bogus,
+	sldns_pkt_section section, struct module_qstate* qstate, int* verified,
+	char* reasonbuf, size_t reasonlen);
 
 /** 
  * verify rrset against one specific dnskey (from rrset) 
@@ -275,37 +284,16 @@ enum sec_status dnskeyset_verify_rrset(struct module_env* env,
  * @param dnskey: DNSKEY rrset, keyset.
  * @param dnskey_idx: which key from the rrset to try.
  * @param reason: if bogus, a string returned, fixed or alloced in scratch.
+ * @param reason_bogus: EDE (RFC8914) code paired with the reason of failure.
  * @param section: section of packet where this rrset comes from.
  * @param qstate: qstate with region.
  * @return secure if *this* key signs any of the signatures on rrset.
  *	unchecked on error or and bogus on bad signature.
  */
-enum sec_status dnskey_verify_rrset(struct module_env* env, 
-	struct val_env* ve, struct ub_packed_rrset_key* rrset, 
-	struct ub_packed_rrset_key* dnskey, size_t dnskey_idx, char** reason,
+enum sec_status dnskey_verify_rrset(struct module_env* env, struct val_env* ve,
+        struct ub_packed_rrset_key* rrset, struct ub_packed_rrset_key* dnskey,
+	size_t dnskey_idx, char** reason, sldns_ede_code *reason_bogus,
 	sldns_pkt_section section, struct module_qstate* qstate);
-
-/** 
- * verify rrset, with dnskey rrset, for a specific rrsig in rrset
- * @param env: module environment, scratch space is used.
- * @param ve: validator environment, date settings.
- * @param now: current time for validation (can be overridden).
- * @param rrset: to be validated.
- * @param dnskey: DNSKEY rrset, keyset to try.
- * @param sig_idx: which signature to try to validate.
- * @param sortree: reused sorted order. Stored in region. Pass NULL at start,
- * 	and for a new rrset.
- * @param reason: if bogus, a string returned, fixed or alloced in scratch.
- * @param section: section of packet where this rrset comes from.
- * @param qstate: qstate with region.
- * @return secure if any key signs *this* signature. bogus if no key signs it,
- *	or unchecked on error.
- */
-enum sec_status dnskeyset_verify_rrset_sig(struct module_env* env, 
-	struct val_env* ve, time_t now, struct ub_packed_rrset_key* rrset, 
-	struct ub_packed_rrset_key* dnskey, size_t sig_idx, 
-	struct rbtree_type** sortree, char** reason, sldns_pkt_section section,
-	struct module_qstate* qstate);
 
 /** 
  * verify rrset, with specific dnskey(from set), for a specific rrsig 
@@ -323,17 +311,19 @@ enum sec_status dnskeyset_verify_rrset_sig(struct module_env* env,
  * 	pass false at start. pass old value only for same rrset and same
  * 	signature (but perhaps different key) for reuse.
  * @param reason: if bogus, a string returned, fixed or alloced in scratch.
+ * @param reason_bogus: EDE (RFC8914) code paired with the reason of failure.
  * @param section: section of packet where this rrset comes from.
  * @param qstate: qstate with region.
  * @return secure if this key signs this signature. unchecked on error or 
  *	bogus if it did not validate.
  */
-enum sec_status dnskey_verify_rrset_sig(struct regional* region, 
-	struct sldns_buffer* buf, struct val_env* ve, time_t now,
-	struct ub_packed_rrset_key* rrset, struct ub_packed_rrset_key* dnskey, 
-	size_t dnskey_idx, size_t sig_idx,
-	struct rbtree_type** sortree, int* buf_canon, char** reason,
-	sldns_pkt_section section, struct module_qstate* qstate);
+enum sec_status dnskey_verify_rrset_sig(struct regional* region,
+        struct sldns_buffer* buf, struct val_env* ve, time_t now,
+        struct ub_packed_rrset_key* rrset, struct ub_packed_rrset_key* dnskey,
+        size_t dnskey_idx, size_t sig_idx,
+        struct rbtree_type** sortree, int* buf_canon,
+        char** reason, sldns_ede_code *reason_bogus,
+        sldns_pkt_section section, struct module_qstate* qstate);
 
 /**
  * canonical compare for two tree entries

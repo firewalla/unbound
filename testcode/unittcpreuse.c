@@ -41,8 +41,11 @@
 #include "config.h"
 #include "testcode/unitmain.h"
 #include "util/log.h"
+#include "util/net_help.h"
 #include "util/random.h"
 #include "services/outside_network.h"
+
+#define MAX_TCP_WAITING_NODES 5
 
 /** add number of new IDs to the reuse tree, randomly chosen */
 static void tcpid_addmore(struct reuse_tcp* reuse,
@@ -228,9 +231,535 @@ static void tcp_reuse_tree_list_test(void)
 	free(outnet.tcp_conns);
 }
 
+static void check_waiting_tcp_list(struct outside_network* outnet,
+	struct waiting_tcp* first, struct waiting_tcp* last, size_t total)
+{
+	size_t i, j;
+	struct waiting_tcp* w = outnet->tcp_wait_first;
+	struct waiting_tcp* n = NULL;
+	if(first) unit_assert(outnet->tcp_wait_first == first);
+	if(last) unit_assert(outnet->tcp_wait_last == last && !last->next_waiting);
+	for(i=0; w; i++) {
+		unit_assert(i<total); /* otherwise we are looping */
+		unit_assert(w->on_tcp_waiting_list);
+		n = w->next_waiting;
+		for(j=0; n; j++) {
+			unit_assert(j<total-i-1); /* otherwise we are looping */
+			unit_assert(n != w);
+			n = n->next_waiting;
+		}
+		w = w->next_waiting;
+	}
+}
+
+/** clear the tcp waiting list */
+static void waiting_tcp_list_clear(struct outside_network* outnet)
+{
+	struct waiting_tcp* w = outnet->tcp_wait_first, *n = NULL;
+	if(!w) return;
+	unit_assert(outnet->tcp_wait_first);
+	unit_assert(outnet->tcp_wait_last);
+	while(w) {
+		n = w->next_waiting;
+		w->on_tcp_waiting_list = 0;
+		w->next_waiting = (struct waiting_tcp*)1; /* In purpose faux value */
+		w = n;
+	}
+	outnet->tcp_wait_first = NULL;
+	outnet->tcp_wait_last = NULL;
+}
+
+/** check removal of the waiting_tcp element on the given position of total
+ *  elements */
+static void check_waiting_tcp_removal(int is_pop,
+	struct outside_network* outnet, struct waiting_tcp* store,
+	size_t position, size_t total)
+{
+	size_t i;
+	struct waiting_tcp* w;
+	waiting_tcp_list_clear(outnet);
+	for(i=0; i<total; i++) {
+		outnet_waiting_tcp_list_add(outnet, &store[i], 0);
+	}
+	check_waiting_tcp_list(outnet, &store[0], &store[total-1], total);
+
+	if(is_pop) {
+		w = outnet_waiting_tcp_list_pop(outnet);
+		unit_assert(w); /* please clang-analyser */
+	} else {
+		w = outnet->tcp_wait_first;
+		for(i=0; i<position; i++) {
+			unit_assert(w); /* please clang-analyser */
+			w = w->next_waiting;
+		}
+		unit_assert(w); /* please clang-analyser */
+		outnet_waiting_tcp_list_remove(outnet, w);
+	}
+	unit_assert(!(w->on_tcp_waiting_list || w->next_waiting));
+
+	if(position == 0 && total == 1) {
+		/* the list should be empty */
+		check_waiting_tcp_list(outnet, NULL, NULL, total-1);
+	} else if(position == 0) {
+		/* first element should be gone */
+		check_waiting_tcp_list(outnet, &store[1], &store[total-1], total-1);
+	} else if(position == total - 1) {
+		/* last element should be gone */
+		check_waiting_tcp_list(outnet, &store[0], &store[total-2], total-1);
+	} else {
+		/* an element should be gone */
+		check_waiting_tcp_list(outnet, &store[0], &store[total-1], total-1);
+	}
+}
+
+static void waiting_tcp_list_test(void)
+{
+	size_t i = 0;
+	struct outside_network outnet;
+	struct waiting_tcp* w, *t = NULL;
+	struct waiting_tcp store[MAX_TCP_WAITING_NODES];
+	memset(&outnet, 0, sizeof(outnet));
+	memset(&store, 0, sizeof(store));
+
+	/* Check add first on empty list */
+	unit_show_func("services/outside_network.c", "outnet_waiting_tcp_list_add_first");
+	t = &store[i];
+	outnet_waiting_tcp_list_add_first(&outnet, t, 0);
+	check_waiting_tcp_list(&outnet, t, t, 1);
+
+	/* Check add */
+	unit_show_func("services/outside_network.c", "outnet_waiting_tcp_list_add");
+	for(i=1; i<MAX_TCP_WAITING_NODES-1; i++) {
+		w = &store[i];
+		outnet_waiting_tcp_list_add(&outnet, w, 0);
+	}
+	check_waiting_tcp_list(&outnet, t, w, MAX_TCP_WAITING_NODES-1);
+
+	/* Check add first on populated list */
+	unit_show_func("services/outside_network.c", "outnet_waiting_tcp_list_add_first");
+	w = &store[i];
+	t = outnet.tcp_wait_last;
+	outnet_waiting_tcp_list_add_first(&outnet, w, 0);
+	check_waiting_tcp_list(&outnet, w, t, MAX_TCP_WAITING_NODES);
+
+	/* Check removal */
+	unit_show_func("services/outside_network.c", "outnet_waiting_tcp_list_remove");
+	check_waiting_tcp_removal(0, &outnet, store, 2, 5);
+	check_waiting_tcp_removal(0, &outnet, store, 1, 3);
+	check_waiting_tcp_removal(0, &outnet, store, 0, 2);
+	check_waiting_tcp_removal(0, &outnet, store, 1, 2);
+	check_waiting_tcp_removal(0, &outnet, store, 0, 1);
+
+	/* Check pop */
+	unit_show_func("services/outside_network.c", "outnet_waiting_tcp_list_pop");
+	check_waiting_tcp_removal(1, &outnet, store, 0, 3);
+	check_waiting_tcp_removal(1, &outnet, store, 0, 2);
+	check_waiting_tcp_removal(1, &outnet, store, 0, 1);
+}
+
+static void check_reuse_write_wait(struct reuse_tcp* reuse,
+	struct waiting_tcp* first, struct waiting_tcp* last, size_t total)
+{
+	size_t i, j;
+	struct waiting_tcp* w = reuse->write_wait_first;
+	struct waiting_tcp* n = NULL;
+	if(first) unit_assert(reuse->write_wait_first == first && !first->write_wait_prev);
+	if(last) unit_assert(reuse->write_wait_last == last && !last->write_wait_next);
+	/* check one way */
+	for(i=0; w; i++) {
+		unit_assert(i<total); /* otherwise we are looping */
+		unit_assert(w->write_wait_queued);
+		n = w->write_wait_next;
+		for(j=0; n; j++) {
+			unit_assert(j<total-i-1); /* otherwise we are looping */
+			unit_assert(n != w);
+			n = n->write_wait_next;
+		}
+		w = w->write_wait_next;
+	}
+	/* check the other way */
+	w = reuse->write_wait_last;
+	for(i=0; w; i++) {
+		unit_assert(i<total); /* otherwise we are looping */
+		unit_assert(w->write_wait_queued);
+		n = w->write_wait_prev;
+		for(j=0; n; j++) {
+			unit_assert(j<total-i-1); /* otherwise we are looping */
+			unit_assert(n != w);
+			n = n->write_wait_prev;
+		}
+		w = w->write_wait_prev;
+	}
+}
+
+/** clear the tcp waiting list */
+static void reuse_write_wait_clear(struct reuse_tcp* reuse)
+{
+	struct waiting_tcp* w = reuse->write_wait_first, *n = NULL;
+	if(!w) return;
+	unit_assert(reuse->write_wait_first);
+	unit_assert(reuse->write_wait_last);
+	while(w) {
+		n = w->write_wait_next;
+		w->write_wait_queued = 0;
+		w->write_wait_next = (struct waiting_tcp*)1;  /* In purpose faux value */
+		w->write_wait_prev = (struct waiting_tcp*)1;  /* In purpose faux value */
+		w = n;
+	}
+	reuse->write_wait_first = NULL;
+	reuse->write_wait_last = NULL;
+}
+
+/** check removal of the reuse_write_wait element on the given position of total
+ *  elements */
+static void check_reuse_write_wait_removal(int is_pop,
+	struct reuse_tcp* reuse, struct waiting_tcp* store,
+	size_t position, size_t total)
+{
+	size_t i;
+	struct waiting_tcp* w;
+	reuse_write_wait_clear(reuse);
+	for(i=0; i<total; i++) {
+		reuse_write_wait_push_back(reuse, &store[i]);
+	}
+	check_reuse_write_wait(reuse, &store[0], &store[total-1], total);
+
+	if(is_pop) {
+		w = reuse_write_wait_pop(reuse);
+	} else {
+		w = reuse->write_wait_first;
+		for(i=0; i<position; i++) w = w->write_wait_next;
+		reuse_write_wait_remove(reuse, w);
+	}
+	unit_assert(!(w->write_wait_queued || w->write_wait_next || w->write_wait_prev));
+
+	if(position == 0 && total == 1) {
+		/* the list should be empty */
+		check_reuse_write_wait(reuse, NULL, NULL, total-1);
+	} else if(position == 0) {
+		/* first element should be gone */
+		check_reuse_write_wait(reuse, &store[1], &store[total-1], total-1);
+	} else if(position == total - 1) {
+		/* last element should be gone */
+		check_reuse_write_wait(reuse, &store[0], &store[total-2], total-1);
+	} else {
+		/* an element should be gone */
+		check_reuse_write_wait(reuse, &store[0], &store[total-1], total-1);
+	}
+}
+
+static void reuse_write_wait_test(void)
+{
+	size_t i;
+	struct reuse_tcp reuse;
+	struct waiting_tcp store[MAX_TCP_WAITING_NODES];
+	struct waiting_tcp* w;
+	memset(&reuse, 0, sizeof(reuse));
+	memset(&store, 0, sizeof(store));
+
+	/* Check adding */
+	unit_show_func("services/outside_network.c", "reuse_write_wait_push_back");
+	for(i=0; i<MAX_TCP_WAITING_NODES; i++) {
+		w = &store[i];
+		reuse_write_wait_push_back(&reuse, w);
+	}
+	check_reuse_write_wait(&reuse, &store[0], w, MAX_TCP_WAITING_NODES);
+
+	/* Check removal */
+	unit_show_func("services/outside_network.c", "reuse_write_wait_remove");
+	check_reuse_write_wait_removal(0, &reuse, store, 2, 5);
+	check_reuse_write_wait_removal(0, &reuse, store, 1, 3);
+	check_reuse_write_wait_removal(0, &reuse, store, 0, 2);
+	check_reuse_write_wait_removal(0, &reuse, store, 1, 2);
+	check_reuse_write_wait_removal(0, &reuse, store, 0, 1);
+
+	/* Check pop */
+	unit_show_func("services/outside_network.c", "reuse_write_wait_pop");
+	check_reuse_write_wait_removal(1, &reuse, store, 0, 3);
+	check_reuse_write_wait_removal(1, &reuse, store, 0, 2);
+	check_reuse_write_wait_removal(1, &reuse, store, 0, 1);
+}
+
+static void shared_port_test_ifs(void)
+{
+	struct shared_ports* shp;
+	struct shared_ports_if* shpif;
+	char* ifs[] = {"1.2.3.4", "1.2.3.5", "::1:2", "::1:3"};
+	int availports[] = {1, 2, 3, 4};
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+
+	shp = shared_ports_create(ifs, 4, 1, 1, availports, 4);
+	unit_assert(shp);
+
+	if(!ipstrtoaddr("1.2.3.4", UNBOUND_DNS_PORT, &addr, &addrlen))
+		log_err("could not parse");
+	shpif = shared_ports_find_if(shp, &addr, addrlen, 0);
+	unit_assert(shpif);
+
+	if(!ipstrtoaddr("1.2.3.5", UNBOUND_DNS_PORT, &addr, &addrlen))
+		log_err("could not parse");
+	shpif = shared_ports_find_if(shp, &addr, addrlen, 0);
+	unit_assert(shpif);
+
+	if(!ipstrtoaddr("::1:2", UNBOUND_DNS_PORT, &addr, &addrlen))
+		log_err("could not parse");
+	shpif = shared_ports_find_if(shp, &addr, addrlen, 0);
+	unit_assert(shpif);
+
+	if(!ipstrtoaddr("::1:3", UNBOUND_DNS_PORT, &addr, &addrlen))
+		log_err("could not parse");
+	shpif = shared_ports_find_if(shp, &addr, addrlen, 0);
+	unit_assert(shpif);
+
+	shared_ports_delete(shp);
+}
+
+/** See if a port is on the shared_ports ports list */
+static int
+pif_list_contains(struct shared_ports_if* shpif, int item)
+{
+	int i;
+	unit_assert(shpif->inuse >= 0 && shpif->inuse <= shpif->avail_total);
+	for(i=0; i< shpif->avail_total - shpif->inuse; i++) {
+		if(shpif->avail_ports[i] == item)
+			return 1;
+	}
+	return 0;
+}
+
+/** See if a number of ports are on the shared_ports list */
+static int
+pif_list_contains_items(struct shared_ports_if* shpif, int item1,
+	int item2, int item3, int item4)
+{
+	if(item1 != -1 && !pif_list_contains(shpif, item1))
+		return 0;
+	if(item2 != -1 && !pif_list_contains(shpif, item2))
+		return 0;
+	if(item3 != -1 && !pif_list_contains(shpif, item3))
+		return 0;
+	if(item4 != -1 && !pif_list_contains(shpif, item4))
+		return 0;
+	return 1;
+}
+
+static void shared_port_test_port(void)
+{
+	struct shared_ports* shp;
+	struct shared_ports_if* shpif;
+	char* ifs[] = {"1.2.3.4", "1.2.3.5"};
+	int availports[] = {1, 2, 3, 4};
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	int p1, p2, p3, reused;
+	struct ub_randstate* rnd;
+
+	rnd = ub_initstate(NULL);
+	unit_assert(rnd);
+
+	shp = shared_ports_create(ifs, 2, 1, 1, availports, 4);
+	unit_assert(shp);
+
+	if(!ipstrtoaddr("1.2.3.4", UNBOUND_DNS_PORT, &addr, &addrlen))
+		log_err("could not parse");
+	shpif = shared_ports_find_if(shp, &addr, addrlen, 0);
+	unit_assert(shpif);
+
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 0);
+	unit_assert(pif_list_contains_items(shpif, 1, 2, 3, 4));
+
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+	unit_assert(!pif_list_contains(shpif, p1));
+	if(p1 != 1) unit_assert(pif_list_contains(shpif, 1));
+	if(p1 != 2) unit_assert(pif_list_contains(shpif, 2));
+	if(p1 != 3) unit_assert(pif_list_contains(shpif, 3));
+	if(p1 != 4) unit_assert(pif_list_contains(shpif, 4));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 1);
+
+	shared_ports_return_port(shp, shpif, p1);
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 0);
+	unit_assert(pif_list_contains_items(shpif, 1, 2, 3, 4));
+
+	/* pick up two items */
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p2, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p2 != 0);
+	unit_assert(!pif_list_contains(shpif, p1));
+	unit_assert(!pif_list_contains(shpif, p2));
+	if(p1 != 1 && p2 != 1) unit_assert(pif_list_contains(shpif, 1));
+	if(p1 != 2 && p2 != 2) unit_assert(pif_list_contains(shpif, 2));
+	if(p1 != 3 && p2 != 3) unit_assert(pif_list_contains(shpif, 3));
+	if(p1 != 4 && p2 != 4) unit_assert(pif_list_contains(shpif, 4));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 2);
+
+	shared_ports_return_port(shp, shpif, p1);
+	unit_assert(pif_list_contains(shpif, p1));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 1);
+
+	shared_ports_return_port(shp, shpif, p2);
+	unit_assert(pif_list_contains(shpif, p2));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 0);
+	unit_assert(pif_list_contains_items(shpif, 1, 2, 3, 4));
+
+	/* pick up three items */
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p2, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p2 != 0);
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p3, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p3 != 0);
+	unit_assert(!pif_list_contains(shpif, p1));
+	unit_assert(!pif_list_contains(shpif, p2));
+	unit_assert(!pif_list_contains(shpif, p3));
+	if(p1 != 1 && p2 != 1 && p3 != 1)
+		unit_assert(pif_list_contains(shpif, 1));
+	if(p1 != 2 && p2 != 2 && p3 != 2)
+		unit_assert(pif_list_contains(shpif, 2));
+	if(p1 != 3 && p2 != 3 && p3 != 3)
+		unit_assert(pif_list_contains(shpif, 3));
+	if(p1 != 4 && p2 != 4 && p3 != 4)
+		unit_assert(pif_list_contains(shpif, 4));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 3);
+
+	shared_ports_return_port(shp, shpif, p1);
+	unit_assert(pif_list_contains(shpif, p1));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 2);
+
+	shared_ports_return_port(shp, shpif, p2);
+	unit_assert(pif_list_contains(shpif, p2));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 1);
+
+	shared_ports_return_port(shp, shpif, p3);
+	unit_assert(pif_list_contains(shpif, p3));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 0);
+	unit_assert(pif_list_contains_items(shpif, 1, 2, 3, 4));
+
+	/* pick up all four items */
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0, 0, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 0);
+	unit_assert(p1 != 0);
+	unit_assert(!pif_list_contains(shpif, 1));
+	unit_assert(!pif_list_contains(shpif, 2));
+	unit_assert(!pif_list_contains(shpif, 3));
+	unit_assert(!pif_list_contains(shpif, 4));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 4);
+
+	/* more fetches fail, it is fully inuse. */
+	unit_assert(!shared_ports_fetch_random(shp, shpif, rnd, 0, 0, &p2,
+		&reused));
+	unit_assert(!shared_ports_fetch_random(shp, shpif, rnd, 0, 0, &p3,
+		&reused));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 4);
+
+	/* reuse is then always the case */
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0 /* can reuse */, 4 /* reusenum */, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 1);
+	unit_assert(p1 >= 0 && p1 < 4 /* reusenum */);
+
+	if(!shared_ports_fetch_random(shp, shpif, rnd,
+		0 /* can reuse */, 4 /* reusenum */, &p1, &reused)) {
+		unit_assert(0); /* should succeed */
+	}
+	unit_assert(reused == 1);
+	unit_assert(p1 >= 0 && p1 < 4 /* reusenum */);
+
+	/* return all the ports */
+	shared_ports_return_port(shp, shpif, 1);
+	unit_assert(pif_list_contains(shpif, 1));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 3);
+	shared_ports_return_port(shp, shpif, 2);
+	unit_assert(pif_list_contains(shpif, 2));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 2);
+	shared_ports_return_port(shp, shpif, 3);
+	unit_assert(pif_list_contains(shpif, 3));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 1);
+	shared_ports_return_port(shp, shpif, 4);
+	unit_assert(pif_list_contains(shpif, 4));
+	unit_assert(shpif->avail_total == 4);
+	unit_assert(shpif->inuse == 0);
+	unit_assert(pif_list_contains_items(shpif, 1, 2, 3, 4));
+
+	shared_ports_delete(shp);
+	ub_randfree(rnd);
+}
+
 void tcpreuse_test(void)
 {
     unit_show_feature("tcp_reuse");
     tcpid_test();
     tcp_reuse_tree_list_test();
+    waiting_tcp_list_test();
+    reuse_write_wait_test();
+    unit_show_feature("shared_ports");
+    shared_port_test_ifs();
+    shared_port_test_port();
 }

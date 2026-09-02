@@ -2,6 +2,7 @@
 server:
 	target-fetch-policy: "0 0 0 0 0"
 	minimal-responses: no
+	iter-scrub-promiscuous: no
 	rrset-roundrobin: no
 
 stub-zone:
@@ -95,6 +96,8 @@ REPLY QR RA NOERROR
 SECTION QUESTION
 ns.example.com. IN AAAA
 SECTION ANSWER
+SECTION AUTHORITY
+example.com. IN SOA ns.example.com. root.example.com. 4 14400 3600 604800 3600
 ENTRY_END
 
 ENTRY_BEGIN
@@ -104,6 +107,8 @@ REPLY QR RA NOERROR
 SECTION QUESTION
 lame.example.com. IN AAAA
 SECTION ANSWER
+SECTION AUTHORITY
+example.com. IN SOA ns.example.com. root.example.com. 4 14400 3600 604800 3600
 ENTRY_END
 
 ENTRY_BEGIN
