@@ -4,7 +4,7 @@ PACKAGE_DIR="./package/unbound/"
 rm -fr "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR"
 
-sudo apt install -y libexpat-dev libhiredis-dev libssl-dev byacc
+sudo apt install -y libexpat-dev libhiredis-dev libssl-dev byacc flex bison
 make clean
 ./configure --with-libhiredis
 make -j4
