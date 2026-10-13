@@ -289,7 +289,14 @@ config_create(void)
 	cfg->serve_expired_ttl = 86400;
 	cfg->serve_expired_ttl_reset = 0;
 	cfg->serve_expired_reply_ttl = 30;
-	cfg->serve_expired_client_timeout = 1800;
+	/* Firewalla: upstream changed this from 0 to 1800 in 1.23.0 to follow
+	 * RFC 8767. Our boxes enable serve-expired for latency and resolve
+	 * recursively from the root, so the RFC behaviour costs a full
+	 * recursion on every expired-cache hit. Keep the pre-1.23.0 default.
+	 * Do NOT change serve_expired_ttl or val_clean_additional with it:
+	 * the first bounds how long stale data may be served, the second is
+	 * part of the CVE-2026-85501 (Retrap) fix. */
+	cfg->serve_expired_client_timeout = 0;
 	cfg->serve_original_ttl = 0;
 	cfg->zonemd_permissive_mode = 0;
 	cfg->add_holddown = 30*24*3600;
